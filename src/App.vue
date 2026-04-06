@@ -2,8 +2,10 @@
 import { ref, computed, onMounted } from 'vue';
 import HlsPlayer from './components/HlsPlayer.vue';
 import SubscriptionForm from './components/SubscriptionForm.vue';
+import EPGSubscriptionForm from './components/EPGSubscriptionForm.vue';
 import SubscriptionList from './components/SubscriptionList.vue';
 import ChannelList from './components/ChannelList.vue';
+import EPGDisplay from './components/EPGDisplay.vue';
 import type { Subscription } from './types';
 import {
   getSubscriptions,
@@ -11,13 +13,20 @@ import {
   deleteSubscription,
   updateSubscription,
   fetchPlaylist,
+  getEPGSubscriptions,
+  saveEPGSubscription,
+  deleteEPGSubscription,
 } from './utils/subscription';
+import { findCurrentProgram, matchChannelWithEPG } from './utils/epgParser';
 
 const subscriptions = ref<Subscription[]>([]);
+const epgSubscriptions = ref<any[]>([]);
 const activeSubscriptionId = ref<string | null>(null);
-const showAddForm = ref(false);
+const showAddStreamForm = ref(false);
+const showAddEPGForm = ref(false);
 const currentStreamUrl = ref<string>('');
 const activeChannelIndex = ref(0);
+const activeTab = ref<'stream' | 'epg'>('stream');
 
 const activeSubscription = computed(() => {
   if (!activeSubscriptionId.value) return null;
@@ -28,15 +37,40 @@ const currentChannels = computed(() => {
   return activeSubscription.value?.channels || [];
 });
 
+const currentEPGPrograms = computed(() => {
+  if (!activeSubscription.value || !currentChannel.value) return [];
+
+  const channelName = currentChannel.value.name;
+
+  for (const epgSub of epgSubscriptions.value) {
+    const matchedChannelId = matchChannelWithEPG(channelName, epgSub.channels);
+    if (matchedChannelId) {
+      return epgSub.programs.filter(p => p.channel === matchedChannelId);
+    }
+  }
+
+  return [];
+});
+
+const currentChannel = computed(() => {
+  if (!activeSubscription.value || currentChannels.value.length === 0) return null;
+  return currentChannels.value[activeChannelIndex.value] || null;
+});
+
 onMounted(() => {
   loadSubscriptions();
+  loadEPGSubscriptions();
 });
 
 const loadSubscriptions = () => {
   subscriptions.value = getSubscriptions();
 };
 
-const handleAddSubscription = async (data: {
+const loadEPGSubscriptions = () => {
+  epgSubscriptions.value = getEPGSubscriptions();
+};
+
+const handleAddStreamSubscription = async (data: {
   name: string;
   url: string;
   type: 'single' | 'playlist';
@@ -54,27 +88,48 @@ const handleAddSubscription = async (data: {
     updatedAt: now,
   };
 
-  // 如果是播放列表且成功获取了频道，保存频道信息
   if (data.type === 'playlist' && data.channels.length > 0) {
     saveSubscription(newSubscription);
   } else if (data.type === 'single') {
-    // 单一直播流
     saveSubscription(newSubscription);
   } else {
-    // 播放列表但未能获取频道，保存为空频道列表
     saveSubscription(newSubscription);
   }
 
   loadSubscriptions();
-  showAddForm.value = false;
+  showAddStreamForm.value = false;
 
-  // 自动选中新添加的订阅
   activeSubscriptionId.value = newSubscription.id;
   if (data.type === 'single') {
     currentStreamUrl.value = data.url;
   } else if (data.channels.length > 0) {
     currentStreamUrl.value = data.channels[0].url;
   }
+};
+
+const handleAddEPGSubscription = (data: {
+  name: string;
+  url: string;
+  type: 'xmltv' | 'diyp';
+  programs: any[];
+  channels: any[];
+}) => {
+  const now = Date.now();
+  const newEPGSubscription = {
+    id: crypto.randomUUID(),
+    name: data.name,
+    url: data.url,
+    type: data.type,
+    programs: data.programs,
+    channels: data.channels,
+    lastUpdate: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  saveEPGSubscription(newEPGSubscription);
+  loadEPGSubscriptions();
+  showAddEPGForm.value = false;
 };
 
 const handleSelectSubscription = (id: string) => {
@@ -104,6 +159,13 @@ const handleDeleteSubscription = (id: string) => {
   }
 };
 
+const handleDeleteEPGSubscription = (id: string) => {
+  if (confirm('确定要删除这个EPG订阅吗？')) {
+    deleteEPGSubscription(id);
+    loadEPGSubscriptions();
+  }
+};
+
 const handleSelectChannel = (index: number) => {
   if (!activeSubscription.value) return;
 
@@ -111,7 +173,6 @@ const handleSelectChannel = (index: number) => {
   const sub = activeSubscription.value;
   currentStreamUrl.value = sub.channels[index]?.url || '';
 
-  // 保存当前频道索引
   sub.currentChannelIndex = index;
   sub.updatedAt = Date.now();
   updateSubscription(sub);
@@ -132,6 +193,35 @@ const handleRefreshPlaylist = async () => {
     console.error(e);
   }
 };
+
+const handleRefreshEPG = async (epgSub: any) => {
+  try {
+    const { fetchUrlContent } = await import('./utils/tauriApi');
+    const { parseXMLTV, parseDIYP } = await import('./utils/epgParser');
+
+    const content = await fetchUrlContent(epgSub.url);
+    let result;
+
+    if (epgSub.type === 'xmltv') {
+      result = parseXMLTV(content);
+    } else {
+      result = parseDIYP(content);
+    }
+
+    epgSub.programs = result.programs;
+    epgSub.channels = result.channels;
+    epgSub.lastUpdate = Date.now();
+    epgSub.updatedAt = Date.now();
+
+    const { updateEPGSubscription } = await import('./utils/subscription');
+    updateEPGSubscription(epgSub);
+    loadEPGSubscriptions();
+    alert('EPG已刷新');
+  } catch (e) {
+    alert('刷新EPG失败');
+    console.error(e);
+  }
+};
 </script>
 
 <template>
@@ -142,20 +232,58 @@ const handleRefreshPlaylist = async () => {
 
     <div class="app-content">
       <aside class="sidebar">
-        <SubscriptionList
-            v-if="!showAddForm"
-            :subscriptions="subscriptions"
-            :active-id="activeSubscriptionId || ''"
-            @add="showAddForm = true"
-            @select="handleSelectSubscription"
-            @delete="handleDeleteSubscription"
-        />
+        <div class="tab-buttons">
+          <button
+              :class="['tab-btn', { active: activeTab === 'stream' }]"
+              @click="activeTab = 'stream'"
+          >
+            📡 直播源
+          </button>
+          <button
+              :class="['tab-btn', { active: activeTab === 'epg' }]"
+              @click="activeTab = 'epg'"
+          >
+            📋 EPG
+          </button>
+        </div>
 
-        <SubscriptionForm
-            v-else
-            @submit="handleAddSubscription"
-            @cancel="showAddForm = false"
-        />
+        <div v-if="activeTab === 'stream'" class="tab-content">
+          <SubscriptionList
+              v-if="!showAddStreamForm"
+              :subscriptions="subscriptions"
+              :active-id="activeSubscriptionId || ''"
+              title="直播源订阅"
+              hint-text="点击上方添加按钮添加直播源订阅"
+              @add="showAddStreamForm = true"
+              @select="handleSelectSubscription"
+              @delete="handleDeleteSubscription"
+          />
+
+          <SubscriptionForm
+              v-else
+              @submit="handleAddStreamSubscription"
+              @cancel="showAddStreamForm = false"
+          />
+        </div>
+
+        <div v-else class="tab-content">
+          <SubscriptionList
+              v-if="!showAddEPGForm"
+              :subscriptions="epgSubscriptions"
+              :active-id="''"
+              title="EPG订阅"
+              hint-text="点击上方添加按钮添加EPG订阅"
+              @add="showAddEPGForm = true"
+              @select="() => {}"
+              @delete="handleDeleteEPGSubscription"
+          />
+
+          <EPGSubscriptionForm
+              v-else
+              @submit="handleAddEPGSubscription"
+              @cancel="showAddEPGForm = false"
+          />
+        </div>
 
         <button
             v-if="activeSubscription?.type === 'playlist'"
@@ -164,6 +292,18 @@ const handleRefreshPlaylist = async () => {
         >
           🔄 刷新播放列表
         </button>
+
+        <div v-if="epgSubscriptions.length > 0" class="epg-refresh-section">
+          <button
+              v-for="epgSub in epgSubscriptions"
+              :key="epgSub.id"
+              @click="handleRefreshEPG(epgSub)"
+              class="btn-refresh-epg"
+              :title="`刷新 ${epgSub.name}`"
+          >
+            🔄 {{ epgSub.name }}
+          </button>
+        </div>
       </aside>
 
       <section class="main-content">
@@ -194,6 +334,12 @@ const handleRefreshPlaylist = async () => {
             :channels="currentChannels"
             :active-index="activeChannelIndex"
             @select="handleSelectChannel"
+        />
+
+        <EPGDisplay
+            v-if="currentChannel && currentEPGPrograms.length > 0"
+            :programs="currentEPGPrograms"
+            :channel-name="currentChannel.name"
         />
       </section>
     </div>
@@ -258,6 +404,41 @@ body {
   border-right: 1px solid var(--border-color);
   padding: 20px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.tab-buttons {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.tab-btn {
+  flex: 1;
+  padding: 10px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.tab-btn:hover {
+  background: var(--border-color);
+  color: var(--text-primary);
+}
+
+.tab-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.tab-content {
+  flex: 1;
 }
 
 .main-content {
@@ -354,6 +535,34 @@ body {
   border-color: var(--accent);
 }
 
+.epg-refresh-section {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.btn-refresh-epg {
+  width: 100%;
+  padding: 10px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-refresh-epg:hover {
+  background: var(--border-color);
+  border-color: #8b5cf6;
+}
+
 @media (max-width: 768px) {
   .app-content {
     flex-direction: column;
@@ -367,3 +576,4 @@ body {
   }
 }
 </style>
+

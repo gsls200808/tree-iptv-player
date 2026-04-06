@@ -21,3 +21,30 @@
 - 播放列表diyp txt  普通txt 等格式兼容 待排期
 - m3u DRM 支持 待排期
 - mpv DRM 支持 待排期
+
+
+
+# 开发和运行
+
+## 开发
+
+开发环境运行
+
+```
+# 安装依赖
+npm install
+
+# 启动开发
+npm run tauri dev
+```
+
+## 打包二进制
+
+打包成二进制运行
+
+```
+npm run tauri build
+```
+
+
+

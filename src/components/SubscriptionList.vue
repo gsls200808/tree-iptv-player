@@ -1,13 +1,13 @@
 <template>
   <div class="subscription-list">
     <div class="list-header">
-      <h3>订阅列表</h3>
+      <h3>{{ title }}</h3>
       <button @click="$emit('add')" class="btn-add">+ 添加</button>
     </div>
 
     <div v-if="subscriptions.length === 0" class="empty-state">
       <p>暂无订阅</p>
-      <p class="hint">点击上方"添加"按钮添加流媒体订阅</p>
+      <p class="hint">{{ hintText }}</p>
     </div>
 
     <div v-else class="list-items">
@@ -20,10 +20,10 @@
         <div class="item-info">
           <div class="item-name">{{ sub.name }}</div>
           <div class="item-meta">
-            <span :class="['badge', sub.type === 'playlist' ? 'badge-playlist' : 'badge-single']">
-              {{ sub.type === 'playlist' ? '播放列表' : '直播流' }}
+            <span :class="['badge', getTypeBadgeClass(sub)]">
+              {{ getTypeText(sub) }}
             </span>
-            <span v-if="sub.type === 'playlist'" class="channel-count">
+            <span v-if="isStreamSubscription(sub) && sub.type === 'playlist'" class="channel-count">
               {{ sub.channels.length }} 个频道
             </span>
           </div>
@@ -42,11 +42,11 @@
 </template>
 
 <script setup lang="ts">
-import type { Subscription } from '../types';
-
 defineProps<{
-  subscriptions: Subscription[];
+  subscriptions: any[];
   activeId?: string;
+  title: string;
+  hintText: string;
 }>();
 
 defineEmits<{
@@ -54,6 +54,26 @@ defineEmits<{
   select: [id: string];
   delete: [id: string];
 }>();
+
+const isStreamSubscription = (sub: any) => {
+  return sub.type === 'single' || sub.type === 'playlist';
+};
+
+const getTypeBadgeClass = (sub: any) => {
+  if (sub.type === 'playlist') return 'badge-playlist';
+  if (sub.type === 'single') return 'badge-single';
+  if (sub.type === 'xmltv') return 'badge-xmltv';
+  if (sub.type === 'diyp') return 'badge-diyp';
+  return 'badge-single';
+};
+
+const getTypeText = (sub: any) => {
+  if (sub.type === 'playlist') return '播放列表';
+  if (sub.type === 'single') return '直播流';
+  if (sub.type === 'xmltv') return 'XMLTV';
+  if (sub.type === 'diyp') return 'DIYP';
+  return '未知';
+};
 </script>
 
 <style scoped>
@@ -165,6 +185,16 @@ defineEmits<{
   color: white;
 }
 
+.badge-xmltv {
+  background: #8b5cf6;
+  color: white;
+}
+
+.badge-diyp {
+  background: #f59e0b;
+  color: white;
+}
+
 .channel-count {
   color: var(--text-secondary);
 }
@@ -190,3 +220,4 @@ defineEmits<{
   color: white;
 }
 </style>
+

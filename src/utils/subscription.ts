@@ -2,6 +2,7 @@ import type { Subscription, ChannelItem } from '../types';
 import { fetchUrlContent } from './tauriApi';
 
 const STORAGE_KEY = 'stream_subscriptions';
+const EPG_STORAGE_KEY = 'epg_subscriptions';
 
 export function parseM3U(content: string): ChannelItem[] {
     const lines = content.split('\n').map(line => line.trim());
@@ -102,4 +103,33 @@ export function deleteSubscription(id: string): void {
 export function updateSubscription(subscription: Subscription): void {
     saveSubscription(subscription);
 }
+
+export function getEPGSubscriptions(): any[] {
+    const data = localStorage.getItem(EPG_STORAGE_KEY);
+    return data ? JSON.parse(data) : [];
+}
+
+export function saveEPGSubscription(epgSub: any): void {
+    const subscriptions = getEPGSubscriptions();
+    const index = subscriptions.findIndex(s => s.id === epgSub.id);
+
+    if (index >= 0) {
+        subscriptions[index] = epgSub;
+    } else {
+        subscriptions.push(epgSub);
+    }
+
+    localStorage.setItem(EPG_STORAGE_KEY, JSON.stringify(subscriptions));
+}
+
+export function deleteEPGSubscription(id: string): void {
+    const subscriptions = getEPGSubscriptions();
+    const filtered = subscriptions.filter(s => s.id !== id);
+    localStorage.setItem(EPG_STORAGE_KEY, JSON.stringify(filtered));
+}
+
+export function updateEPGSubscription(epgSub: any): void {
+    saveEPGSubscription(epgSub);
+}
+
 
