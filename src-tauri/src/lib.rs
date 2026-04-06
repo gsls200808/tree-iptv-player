@@ -51,6 +51,24 @@ async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+async fn fetch_url_with_final_url(url: String) -> Result<(Vec<u8>, String), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .redirect(reqwest::redirect::Policy::default())
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let response = client.get(&url).send().await
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    let final_url = response.url().to_string();
+
+    let bytes = response.bytes().await
+        .map_err(|e| format!("Failed to read bytes: {}", e))?;
+
+    Ok((bytes.to_vec(), final_url))
+}
+
 #[command]
 async fn proxy_hls_request(url: String) -> Result<Vec<u8>, String> {
     fetch_url_bytes(url).await
@@ -202,50 +220,70 @@ async fn handle_proxy_request(
 
     println!("Proxying request to: {}", full_url);
 
-    match fetch_url_bytes(full_url.clone()).await {
-        Ok(bytes) => {
-            let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u");
-            let content_type = if is_m3u8 {
-                "application/vnd.apple.mpegurl"
-            } else if full_url.contains(".ts") {
-                "video/MP2T"
-            } else {
-                "application/octet-stream"
-            };
+    let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u") || full_url.contains("vodId=");
 
-            let mut response_body = bytes.clone();
+    if is_m3u8 {
+        match fetch_url_with_final_url(full_url.clone()).await {
+            Ok((bytes, final_url)) => {
+                let mut response_body = bytes.clone();
 
-            if is_m3u8 {
                 if let Ok(m3u8_text) = String::from_utf8(bytes) {
-                    let base_url = if full_url.contains("?") {
-                        let url_without_query = &full_url[..full_url.find("?").unwrap()];
+                    let base_url = if final_url.contains("?") {
+                        let url_without_query = &final_url[..final_url.find("?").unwrap()];
                         &url_without_query[..url_without_query.rfind("/").unwrap() + 1]
                     } else {
-                        &full_url[..full_url.rfind("/").unwrap() + 1]
+                        &final_url[..final_url.rfind("/").unwrap() + 1]
                     };
 
                     let modified_m3u8 = rewrite_m3u8_urls(&m3u8_text, base_url);
                     response_body = modified_m3u8.into_bytes();
-                    println!("Rewrote m3u8 URLs, new size: {} bytes", response_body.len());
+                    println!("Rewrote m3u8 URLs with base: {}, new size: {} bytes", base_url, response_body.len());
                 }
+
+                println!("Successfully fetched {} bytes", response_body.len());
+
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(response_body))
+                    .unwrap())
             }
-
-            println!("Successfully fetched {} bytes", response_body.len());
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, content_type)
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from(response_body))
-                .unwrap())
+            Err(e) => {
+                eprintln!("Proxy fetch error: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(format!("Proxy error: {}", e)))
+                    .unwrap())
+            }
         }
-        Err(e) => {
-            eprintln!("Proxy fetch error: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from(format!("Proxy error: {}", e)))
-                .unwrap())
+    } else {
+        match fetch_url_bytes(full_url.clone()).await {
+            Ok(bytes) => {
+                let content_type = if full_url.contains(".ts") {
+                    "video/MP2T"
+                } else {
+                    "application/octet-stream"
+                };
+
+                println!("Successfully fetched {} bytes", bytes.len());
+
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(bytes))
+                    .unwrap())
+            }
+            Err(e) => {
+                eprintln!("Proxy fetch error: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(format!("Proxy error: {}", e)))
+                    .unwrap())
+            }
         }
     }
 }
