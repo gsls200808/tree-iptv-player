@@ -16,7 +16,6 @@ import {
   saveEPGSubscription,
   deleteEPGSubscription,
 } from './utils/subscription';
-import { matchChannelWithEPG } from './utils/epgParser';
 
 const subscriptions = ref<Subscription[]>([]);
 const epgSubscriptions = ref<any[]>([]);
@@ -35,28 +34,10 @@ const activeSubscription = computed(() => {
 const currentChannels = computed(() => {
   return activeSubscription.value?.channels || [];
 });
-
-const currentChannel = computed(() => {
+computed(() => {
   if (!activeSubscription.value || currentChannels.value.length === 0) return null;
   return currentChannels.value[activeChannelIndex.value] || null;
 });
-
-
-const currentEPGPrograms = computed(() => {
-  if (!activeSubscription.value || !currentChannel.value) return [];
-
-  const channelName = currentChannel.value.name;
-
-  for (const epgSub of epgSubscriptions.value) {
-    const matchedChannelId = matchChannelWithEPG(channelName, epgSub.channels);
-    if (matchedChannelId) {
-      return epgSub.programs.filter(p => p.channel === matchedChannelId);
-    }
-  }
-
-  return [];
-});
-
 onMounted(() => {
   loadSubscriptions();
   loadEPGSubscriptions();
