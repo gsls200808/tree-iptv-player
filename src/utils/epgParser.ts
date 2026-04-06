@@ -17,7 +17,7 @@ export function parseXMLTV(content: string): { programs: EPGProgram[]; channels:
             channels.push({
                 id,
                 displayName: displayNameEl.textContent || '',
-                icon: iconEl?.getAttribute('src'),
+                icon: iconEl?.getAttribute('src') || undefined,
             });
         }
     }
@@ -40,8 +40,8 @@ export function parseXMLTV(content: string): { programs: EPGProgram[]; channels:
                 start: parseXMLTVDate(start),
                 stop: parseXMLTVDate(stop),
                 title: titleEl.textContent || '',
-                description: descEl?.textContent,
-                icon: iconEl?.getAttribute('src'),
+                description: descEl?.textContent || undefined,
+                icon: iconEl?.getAttribute('src') || undefined,
             });
         }
     }

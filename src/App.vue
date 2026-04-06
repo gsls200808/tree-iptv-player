@@ -36,6 +36,12 @@ const currentChannels = computed(() => {
   return activeSubscription.value?.channels || [];
 });
 
+const currentChannel = computed(() => {
+  if (!activeSubscription.value || currentChannels.value.length === 0) return null;
+  return currentChannels.value[activeChannelIndex.value] || null;
+});
+
+
 const currentEPGPrograms = computed(() => {
   if (!activeSubscription.value || !currentChannel.value) return [];
 
@@ -49,11 +55,6 @@ const currentEPGPrograms = computed(() => {
   }
 
   return [];
-});
-
-const currentChannel = computed(() => {
-  if (!activeSubscription.value || currentChannels.value.length === 0) return null;
-  return currentChannels.value[activeChannelIndex.value] || null;
 });
 
 onMounted(() => {
