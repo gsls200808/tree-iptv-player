@@ -5,7 +5,6 @@ import SubscriptionForm from './components/SubscriptionForm.vue';
 import EPGSubscriptionForm from './components/EPGSubscriptionForm.vue';
 import SubscriptionList from './components/SubscriptionList.vue';
 import ChannelList from './components/ChannelList.vue';
-import EPGDisplay from './components/EPGDisplay.vue';
 import type { Subscription } from './types';
 import {
   getSubscriptions,
@@ -17,7 +16,7 @@ import {
   saveEPGSubscription,
   deleteEPGSubscription,
 } from './utils/subscription';
-import { findCurrentProgram, matchChannelWithEPG } from './utils/epgParser';
+import { matchChannelWithEPG } from './utils/epgParser';
 
 const subscriptions = ref<Subscription[]>([]);
 const epgSubscriptions = ref<any[]>([]);
@@ -333,14 +332,10 @@ const handleRefreshEPG = async (epgSub: any) => {
             v-if="currentChannels.length > 0"
             :channels="currentChannels"
             :active-index="activeChannelIndex"
+            :epg-subscriptions="epgSubscriptions"
             @select="handleSelectChannel"
         />
 
-        <EPGDisplay
-            v-if="currentChannel && currentEPGPrograms.length > 0"
-            :programs="currentEPGPrograms"
-            :channel-name="currentChannel.name"
-        />
       </section>
     </div>
   </main>

@@ -119,8 +119,16 @@ export function findCurrentProgram(programs: EPGProgram[], channelName: string):
 
 export function findProgramsByChannel(programs: EPGProgram[], channelName: string): EPGProgram[] {
     return programs
-        .filter(p => p.channel.toLowerCase() === channelName.toLowerCase())
-        .sort((a, b) => a.start.getTime() - b.start.getTime());
+        .filter(p => {
+            const pChannel = typeof p.channel === 'string' ? p.channel : '';
+            const searchChannel = typeof channelName === 'string' ? channelName : '';
+            return pChannel.toLowerCase() === searchChannel.toLowerCase();
+        })
+        .sort((a, b) => {
+            const aTime = a.start instanceof Date ? a.start.getTime() : new Date(a.start).getTime();
+            const bTime = b.start instanceof Date ? b.start.getTime() : new Date(b.start).getTime();
+            return aTime - bTime;
+        });
 }
 
 export function matchChannelWithEPG(channelName: string, epgChannels: EPGChannel[]): string | null {
