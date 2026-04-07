@@ -58,9 +58,14 @@ function parseXMLTVDate(dateStr: string): Date {
     const hour = dateStr.substring(8, 10);
     const minute = dateStr.substring(10, 12);
     const second = dateStr.substring(12, 14);
+    const tz = dateStr.substring(14).trim();
 
-    return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
+    // 直接拼成标准 ISO 8601 格式，浏览器/JS 自动解析
+    const isoString = `${year}-${month}-${day}T${hour}:${minute}:${second}${tz}`;
+
+    return new Date(isoString);
 }
+
 
 export function parseDIYP(content: string): { programs: EPGProgram[]; channels: EPGChannel[] } {
     try {
