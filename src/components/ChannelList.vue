@@ -41,6 +41,29 @@
     </div>
 
     <div v-else-if="activeTab === 'epg'" class="epg-tab">
+      <div class="epg-date-selector">
+        <button
+            class="date-nav-btn"
+            @click="changeDate(-1)"
+            :disabled="selectedDateOffset <= -6"
+        >
+          ◀
+        </button>
+
+        <div class="date-display">
+          <span class="date-text">{{ formattedDate }}</span>
+          <span class="relative-date">{{ relativeDateText }}</span>
+        </div>
+
+        <button
+            class="date-nav-btn"
+            @click="changeDate(1)"
+            :disabled="selectedDateOffset >= 2"
+        >
+          ▶
+        </button>
+      </div>
+
       <div v-if="loading" class="epg-loading">
         <div class="loading-spinner">⏳</div>
         <p>加载节目表中...</p>
@@ -52,10 +75,7 @@
       </div>
 
       <div v-else-if="diypPrograms.length > 0" class="diyp-programs">
-        <div class="epg-date-info">
-          <span class="date">{{ currentDate }}</span>
-          <span class="channel-name-display">{{ currentChannelName }}</span>
-        </div>
+        <div class="channel-name-display-only">{{ currentChannelName }}</div>
 
         <div
             v-for="(program, index) in diypPrograms"
@@ -102,6 +122,7 @@ const activeTab = ref<'channels' | 'epg'>('channels');
 const loading = ref(false);
 const error = ref<string>('');
 const diypPrograms = ref<any[]>([]);
+const selectedDateOffset = ref(0);
 
 const hasEPGSupport = computed(() => {
   return props.epgSubscriptions && props.epgSubscriptions.length > 0;
@@ -114,6 +135,32 @@ const currentChannelName = computed(() => {
   return '';
 });
 
+const selectedDate = computed(() => {
+  const now = new Date();
+  now.setDate(now.getDate() + selectedDateOffset.value);
+  return now;
+});
+
+const formattedDate = computed(() => {
+  const date = selectedDate.value;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const weekDays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const weekDay = weekDays[date.getDay()];
+  return `${year}-${month}-${day} ${weekDay}`;
+});
+
+const relativeDateText = computed(() => {
+  const offset = selectedDateOffset.value;
+  if (offset === 0) return '今天';
+  if (offset === 1) return '明天';
+  if (offset === 2) return '后天';
+  if (offset === -1) return '昨天';
+  if (offset < 0) return `${Math.abs(offset)}天前`;
+  return '';
+});
+
 const currentDate = computed(() => {
   const now = new Date();
   const year = now.getFullYear();
@@ -123,6 +170,8 @@ const currentDate = computed(() => {
 });
 
 const isCurrentProgram = (program: any) => {
+  if (selectedDateOffset.value !== 0) return false;
+
   const now = new Date();
   const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
@@ -130,6 +179,14 @@ const isCurrentProgram = (program: any) => {
   const endTime = program.end;
 
   return startTime <= currentTime && endTime >= currentTime;
+};
+
+const changeDate = (delta: number) => {
+  const newOffset = selectedDateOffset.value + delta;
+  if (newOffset >= -6 && newOffset <= 2) {
+    selectedDateOffset.value = newOffset;
+    loadEPGData();
+  }
 };
 
 const loadEPGData = async () => {
@@ -148,7 +205,11 @@ const loadEPGData = async () => {
     try {
       if (epgSub.type === 'diyp') {
         const url = epgSub.url;
-        const dateStr = currentDate.value;
+        const date = selectedDate.value;
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        const dateStr = `${year}-${month}-${day}`;
         const channelName = encodeURIComponent(currentChannelName.value);
         const requestUrl = `${url}?ch=${channelName}&date=${dateStr}`;
 
@@ -176,14 +237,30 @@ const loadEPGData = async () => {
             const channelPrograms = findProgramsByChannel(epgSub.programs, matchedChannelId);
 
             if (channelPrograms.length > 0) {
-              diypPrograms.value = channelPrograms.map(prog => ({
-                start: formatTime(prog.start),
-                end: formatTime(prog.stop),
-                title: prog.title,
-                desc: prog.description
-              }));
-              foundPrograms = true;
-              break;
+              const targetDate = selectedDate.value;
+              const targetYear = targetDate.getFullYear();
+              const targetMonth = targetDate.getMonth();
+              const targetDay = targetDate.getDate();
+
+              const filteredPrograms = channelPrograms.filter(prog => {
+                const progDate = prog.start instanceof Date ? prog.start : new Date(prog.start);
+                return progDate.getFullYear() === targetYear &&
+                    progDate.getMonth() === targetMonth &&
+                    progDate.getDate() === targetDay;
+              });
+
+              if (filteredPrograms.length > 0) {
+                diypPrograms.value = filteredPrograms.map(prog => ({
+                  start: formatTime(prog.start),
+                  end: formatTime(prog.stop),
+                  title: prog.title,
+                  desc: prog.description
+                }));
+                foundPrograms = true;
+                break;
+              } else {
+                console.warn(`XMLTV订阅 ${epgSub.name} 在选定日期没有找到节目`);
+              }
             } else {
               console.warn(`XMLTV订阅 ${epgSub.name} 中没有找到频道 ${currentChannelName.value} 的节目`);
             }
@@ -226,6 +303,14 @@ const formatTime = (date: Date | string): string => {
 
 watch(activeTab, (newTab) => {
   if (newTab === 'epg' && currentChannelName.value) {
+    selectedDateOffset.value = 0;
+    loadEPGData();
+  }
+});
+
+watch(() => props.activeIndex, () => {
+  if (activeTab.value === 'epg' && currentChannelName.value) {
+    selectedDateOffset.value = 0;
     loadEPGData();
   }
 });
@@ -342,6 +427,65 @@ const handleImageError = (e: Event) => {
   overflow-y: auto;
 }
 
+.epg-date-selector {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.date-nav-btn {
+  padding: 6px 12px;
+  background: #3b82f6;
+  border: none;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: all 0.2s;
+}
+
+.date-nav-btn:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.date-nav-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.date-display {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.date-text {
+  font-size: 14px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.relative-date {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.channel-name-display-only {
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 14px;
+  color: var(--text-primary);
+  font-weight: 500;
+  text-align: center;
+}
+
 .epg-loading, .epg-error, .epg-empty {
   text-align: center;
   padding: 40px 20px;
@@ -379,28 +523,6 @@ const handleImageError = (e: Event) => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.epg-date-info {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px;
-  background: var(--bg-secondary);
-  border-radius: 6px;
-  margin-bottom: 8px;
-}
-
-.date {
-  font-size: 14px;
-  color: var(--accent);
-  font-weight: 500;
-}
-
-.channel-name-display {
-  font-size: 14px;
-  color: var(--text-primary);
-  font-weight: 500;
 }
 
 .program-item {
