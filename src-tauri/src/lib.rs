@@ -228,14 +228,9 @@ async fn handle_proxy_request(
                 let mut response_body = bytes.clone();
 
                 if let Ok(m3u8_text) = String::from_utf8(bytes) {
-                    let base_url = if final_url.contains("?") {
-                        let url_without_query = &final_url[..final_url.find("?").unwrap()];
-                        &url_without_query[..url_without_query.rfind("/").unwrap() + 1]
-                    } else {
-                        &final_url[..final_url.rfind("/").unwrap() + 1]
-                    };
+                    let base_url = extract_base_url(&final_url);
 
-                    let modified_m3u8 = rewrite_m3u8_urls(&m3u8_text, base_url);
+                    let modified_m3u8 = rewrite_m3u8_urls(&m3u8_text, &base_url);
                     response_body = modified_m3u8.into_bytes();
                     println!("Rewrote m3u8 URLs with base: {}, new size: {} bytes", base_url, response_body.len());
                 }
@@ -246,6 +241,9 @@ async fn handle_proxy_request(
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
                     .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    .header("Pragma", "no-cache")
+                    .header("Expires", "0")
                     .body(Body::from(response_body))
                     .unwrap())
             }
@@ -273,6 +271,7 @@ async fn handle_proxy_request(
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, content_type)
                     .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header("Cache-Control", "public, max-age=3600")
                     .body(Body::from(bytes))
                     .unwrap())
             }
@@ -288,6 +287,20 @@ async fn handle_proxy_request(
     }
 }
 
+fn extract_base_url(final_url: &str) -> String {
+    let url_without_query = if let Some(pos) = final_url.find("?") {
+        &final_url[..pos]
+    } else {
+        final_url
+    };
+
+    if let Some(pos) = url_without_query.rfind("/") {
+        url_without_query[..pos + 1].to_string()
+    } else {
+        final_url.to_string()
+    }
+}
+
 fn rewrite_m3u8_urls(m3u8_content: &str, base_url: &str) -> String {
     let mut result = String::new();
 
@@ -298,6 +311,17 @@ fn rewrite_m3u8_urls(m3u8_content: &str, base_url: &str) -> String {
         } else {
             let segment_url = if line.starts_with("http://") || line.starts_with("https://") {
                 line.to_string()
+            } else if line.starts_with("/") {
+                if let Some(slash_pos) = base_url.find("//") {
+                    if let Some(third_slash) = base_url[slash_pos + 2..].find("/") {
+                        let domain_part = &base_url[..slash_pos + 2 + third_slash];
+                        format!("{}{}", domain_part, line)
+                    } else {
+                        format!("{}{}", base_url, line)
+                    }
+                } else {
+                    format!("{}{}", base_url, line)
+                }
             } else {
                 format!("{}{}", base_url, line)
             };
