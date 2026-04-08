@@ -14,7 +14,9 @@ struct M3u8Session {
     redirect_chain: Vec<String>,
     last_host: String,
     last_base_url: String,
+    #[allow(dead_code)]
     timestamp: std::time::Instant,
+    #[allow(dead_code)]
     media_sequence: Option<u64>,
 }
 
@@ -369,7 +371,7 @@ async fn handle_ts_request(ts_url: String) -> Result<Vec<u8>, String> {
     let info = ts_info.get(&ts_url).cloned();
     drop(ts_info);
 
-    if let Some((m3u8_url, expected_seq)) = info {
+    if let Some((m3u8_url, _expected_seq)) = info {
         let session_map = M3U8_SESSION_MAP.lock().await;
         if let Some(sessions) = session_map.get(&m3u8_url) {
             let actual_host = extract_host_from_url(&ts_url);
