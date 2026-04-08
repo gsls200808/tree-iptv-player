@@ -10,9 +10,19 @@ use hyper::{Body, Request, Response, Server, StatusCode, Method};
 use hyper::header::{CONTENT_TYPE, ACCESS_CONTROL_ALLOW_ORIGIN};
 use std::convert::Infallible;
 
+struct M3u8Session {
+    redirect_chain: Vec<String>,
+    last_host: String,
+    last_base_url: String,
+    timestamp: std::time::Instant,
+    media_sequence: Option<u64>,
+}
+
 lazy_static::lazy_static! {
     static ref CACHE_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
+    static ref M3U8_SESSION_MAP: Mutex<HashMap<String, Vec<M3u8Session>>> = Mutex::new(HashMap::new());
+    static ref TS_TO_M3U8_MAP: Mutex<HashMap<String, (String, u64)>> = Mutex::new(HashMap::new());
 }
 
 #[command]
@@ -51,22 +61,60 @@ async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-async fn fetch_url_with_final_url(url: String) -> Result<(Vec<u8>, String), String> {
+async fn fetch_with_redirect_chain(url: String) -> Result<(Vec<u8>, Vec<String>), String> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .redirect(reqwest::redirect::Policy::default())
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let response = client.get(&url).send().await
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let mut redirect_chain = Vec::new();
+    let mut current_url = url.clone();
 
-    let final_url = response.url().to_string();
+    loop {
+        redirect_chain.push(current_url.clone());
 
-    let bytes = response.bytes().await
-        .map_err(|e| format!("Failed to read bytes: {}", e))?;
+        let response = client.get(&current_url).send().await
+            .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
-    Ok((bytes.to_vec(), final_url))
+        let status = response.status();
+
+        if status.is_redirection() {
+            if let Some(location) = response.headers().get("location") {
+                let location_str = location.to_str()
+                    .map_err(|e| format!("Invalid location header: {}", e))?;
+
+                let next_url = if location_str.starts_with("http://") || location_str.starts_with("https://") {
+                    location_str.to_string()
+                } else {
+                    let base_url = extract_base_url(&current_url);
+                    if location_str.starts_with("/") {
+                        if let Some(slash_pos) = base_url.find("//") {
+                            if let Some(third_slash) = base_url[slash_pos + 2..].find("/") {
+                                let domain_part = &base_url[..slash_pos + 2 + third_slash];
+                                format!("{}{}", domain_part, location_str)
+                            } else {
+                                format!("{}{}", base_url, location_str)
+                            }
+                        } else {
+                            format!("{}{}", base_url, location_str)
+                        }
+                    } else {
+                        format!("{}{}", base_url, location_str)
+                    }
+                };
+
+                current_url = next_url;
+            } else {
+                return Err("Redirect without location header".to_string());
+            }
+        } else {
+            let final_bytes = response.bytes().await
+                .map_err(|e| format!("Failed to read bytes: {}", e))?
+                .to_vec();
+            return Ok((final_bytes, redirect_chain));
+        }
+    }
 }
 
 #[command]
@@ -223,18 +271,8 @@ async fn handle_proxy_request(
     let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u") || full_url.contains("vodId=");
 
     if is_m3u8 {
-        match fetch_url_with_final_url(full_url.clone()).await {
-            Ok((bytes, final_url)) => {
-                let mut response_body = bytes.clone();
-
-                if let Ok(m3u8_text) = String::from_utf8(bytes) {
-                    let base_url = extract_base_url(&final_url);
-
-                    let modified_m3u8 = rewrite_m3u8_urls(&m3u8_text, &base_url);
-                    response_body = modified_m3u8.into_bytes();
-                    println!("Rewrote m3u8 URLs with base: {}, new size: {} bytes", base_url, response_body.len());
-                }
-
+        match handle_m3u8_request(full_url.clone()).await {
+            Ok((response_body, _redirect_chain)) => {
                 println!("Successfully fetched {} bytes", response_body.len());
 
                 Ok(Response::builder()
@@ -257,7 +295,7 @@ async fn handle_proxy_request(
             }
         }
     } else {
-        match fetch_url_bytes(full_url.clone()).await {
+        match handle_ts_request(full_url.clone()).await {
             Ok(bytes) => {
                 let content_type = if full_url.contains(".ts") {
                     "video/MP2T"
@@ -287,6 +325,85 @@ async fn handle_proxy_request(
     }
 }
 
+async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<String>), String> {
+    let (bytes, redirect_chain) = fetch_with_redirect_chain(original_url.clone()).await?;
+
+    let final_url = redirect_chain.last().unwrap_or(&original_url).clone();
+    let mut response_body = bytes.clone();
+
+    if let Ok(m3u8_text) = String::from_utf8(bytes) {
+        let base_url = extract_base_url(&final_url);
+        let host_name = extract_host_from_url(&final_url);
+
+        let media_sequence = extract_media_sequence(&m3u8_text);
+
+        let modified_m3u8 = rewrite_m3u8_urls_with_host(&m3u8_text, &base_url, &host_name, &original_url, media_sequence).await;
+        response_body = modified_m3u8.into_bytes();
+        println!("Rewrote m3u8 URLs with base: {}, host: {}, seq: {:?}, new size: {} bytes", base_url, host_name, media_sequence, response_body.len());
+
+        let new_session = M3u8Session {
+            redirect_chain: redirect_chain.clone(),
+            last_host: host_name,
+            last_base_url: base_url,
+            timestamp: std::time::Instant::now(),
+            media_sequence,
+        };
+
+        let mut session_map = M3U8_SESSION_MAP.lock().await;
+        let sessions = session_map.entry(original_url.clone()).or_insert_with(Vec::new);
+
+        sessions.push(new_session);
+
+        if sessions.len() > 10 {
+            sessions.remove(0);
+        }
+
+        println!("Session history for {}: {} entries", original_url, sessions.len());
+    }
+
+    Ok((response_body, redirect_chain))
+}
+
+async fn handle_ts_request(ts_url: String) -> Result<Vec<u8>, String> {
+    let ts_info = TS_TO_M3U8_MAP.lock().await;
+    let info = ts_info.get(&ts_url).cloned();
+    drop(ts_info);
+
+    if let Some((m3u8_url, expected_seq)) = info {
+        let session_map = M3U8_SESSION_MAP.lock().await;
+        if let Some(sessions) = session_map.get(&m3u8_url) {
+            let actual_host = extract_host_from_url(&ts_url);
+
+            let mut found_match = false;
+            for session in sessions.iter().rev() {
+                if session.last_host == actual_host {
+                    found_match = true;
+                    break;
+                }
+            }
+
+            if !found_match {
+                println!("TS host not in session history: actual={}. Will try fallback if needed.", actual_host);
+            }
+        }
+        drop(session_map);
+    }
+
+    let result = fetch_url_bytes(ts_url.clone()).await;
+
+    if result.is_err() {
+        println!("TS fetch failed for {}, trying fallback logic", ts_url);
+
+        if let Some(fallback_url) = find_fallback_url_for_ts(&ts_url).await {
+            println!("Trying fallback URL: {}", fallback_url);
+            return fetch_url_bytes(fallback_url).await;
+        }
+    }
+
+    result
+}
+
+
 fn extract_base_url(final_url: &str) -> String {
     let url_without_query = if let Some(pos) = final_url.find("?") {
         &final_url[..pos]
@@ -301,7 +418,36 @@ fn extract_base_url(final_url: &str) -> String {
     }
 }
 
-fn rewrite_m3u8_urls(m3u8_content: &str, base_url: &str) -> String {
+fn extract_host_from_url(url: &str) -> String {
+    let url_without_query = if let Some(pos) = url.find("?") {
+        &url[..pos]
+    } else {
+        url
+    };
+
+    if let Some(start) = url_without_query.find("://") {
+        let after_protocol = &url_without_query[start + 3..];
+        if let Some(end) = after_protocol.find("/") {
+            after_protocol[..end].to_string()
+        } else {
+            after_protocol.to_string()
+        }
+    } else {
+        url_without_query.to_string()
+    }
+}
+fn extract_media_sequence(m3u8_content: &str) -> Option<u64> {
+    for line in m3u8_content.lines() {
+        if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
+            if let Some(seq_str) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                return seq_str.trim().parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
+async fn rewrite_m3u8_urls_with_host(m3u8_content: &str, base_url: &str, _host_name: &str, original_m3u8_url: &str, media_sequence: Option<u64>) -> String {
     let mut result = String::new();
 
     for line in m3u8_content.lines() {
@@ -326,12 +472,78 @@ fn rewrite_m3u8_urls(m3u8_content: &str, base_url: &str) -> String {
                 format!("{}{}", base_url, line)
             };
 
+            if let Some(seq) = media_sequence {
+                let mut ts_to_m3u8 = TS_TO_M3U8_MAP.lock().await;
+                ts_to_m3u8.insert(segment_url.clone(), (original_m3u8_url.to_string(), seq));
+                drop(ts_to_m3u8);
+            }
+
             let encoded_url = urlencoding::encode(&segment_url);
             result.push_str(&format!("/proxy/{}\n", encoded_url));
         }
     }
 
     result
+}
+
+async fn find_fallback_url_for_ts(ts_url: &str) -> Option<String> {
+    let ts_info = TS_TO_M3U8_MAP.lock().await;
+    let info = ts_info.get(ts_url).cloned();
+    drop(ts_info);
+
+    let (original_m3u8_url, _expected_seq) = info?;
+
+    let session_map = M3U8_SESSION_MAP.lock().await;
+    let sessions = session_map.get(&original_m3u8_url)?;
+
+    println!("Found {} session entries for m3u8: {}", sessions.len(), original_m3u8_url);
+
+    let filename = extract_filename_from_url(ts_url)?;
+
+    let query_start = ts_url.find("?");
+    let query_string = if let Some(pos) = query_start {
+        &ts_url[pos..]
+    } else {
+        ""
+    };
+
+    for session in sessions.iter().rev() {
+        let redirect_chain = &session.redirect_chain;
+        let current_base_url = &session.last_base_url;
+
+        for chain_url in redirect_chain.iter().rev() {
+            let chain_base_url = extract_base_url(chain_url);
+
+            if chain_base_url == *current_base_url {
+                continue;
+            }
+
+            let fallback_url = format!("{}{}{}", chain_base_url, filename, query_string);
+            println!("Trying fallback to host {}: {}", extract_host_from_url(chain_url), fallback_url);
+
+            if fetch_url_bytes(fallback_url.clone()).await.is_ok() {
+                println!("Fallback successful!");
+                return Some(fallback_url);
+            }
+        }
+    }
+
+    None
+}
+
+
+fn extract_filename_from_url(url: &str) -> Option<String> {
+    let url_without_query = if let Some(pos) = url.find("?") {
+        &url[..pos]
+    } else {
+        url
+    };
+
+    if let Some(pos) = url_without_query.rfind("/") {
+        Some(url_without_query[pos + 1..].to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -348,4 +560,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
