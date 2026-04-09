@@ -25,6 +25,7 @@ lazy_static::lazy_static! {
     static ref PROXY_PORT: Mutex<Option<u16>> = Mutex::new(None);
     static ref M3U8_SESSION_MAP: Mutex<HashMap<String, Vec<M3u8Session>>> = Mutex::new(HashMap::new());
     static ref TS_TO_M3U8_MAP: Mutex<HashMap<String, (String, u64)>> = Mutex::new(HashMap::new());
+    static ref ACTIVE_HOST_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
 }
 
 #[command]
@@ -274,8 +275,15 @@ async fn handle_proxy_request(
 
     if is_m3u8 {
         match handle_m3u8_request(full_url.clone()).await {
-            Ok((response_body, _redirect_chain)) => {
+            Ok((response_body, redirect_chain)) => {
                 println!("Successfully fetched {} bytes", response_body.len());
+
+                println!("\n========== M3U8 Redirect Chain ==========");
+                for (i, url) in redirect_chain.iter().enumerate() {
+                    let host = extract_host_from_url(url);
+                    println!("  [{}] {} (Host: {})", i + 1, url, host);
+                }
+                println!("==========================================\n");
 
                 Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -307,6 +315,12 @@ async fn handle_proxy_request(
 
                 println!("Successfully fetched {} bytes", bytes.len());
 
+                let ts_host = extract_host_from_url(&full_url);
+                println!("\n========== TS Request ==========");
+                println!("  URL: {}", full_url);
+                println!("  Host: {}", ts_host);
+                println!("================================\n");
+
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, content_type)
@@ -337,11 +351,54 @@ async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<Strin
         let base_url = extract_base_url(&final_url);
         let host_name = extract_host_from_url(&final_url);
 
+        println!("\n========== M3U8 Processing ==========");
+        println!("  Original URL: {}", original_url);
+        println!("  Final URL after redirect: {}", final_url);
+        println!("  Current Host: {}", host_name);
+
+        let active_host = {
+            let active_map = ACTIVE_HOST_MAP.lock().await;
+            active_map.get(&original_url).cloned()
+        };
+
+        let (use_base_url, use_host_name) = if let Some(ref active) = active_host {
+            println!("  ✓ Found active host: {}", active);
+
+            let session_map = M3U8_SESSION_MAP.lock().await;
+            if let Some(sessions) = session_map.get(&original_url) {
+                let mut found_session = None;
+                for session in sessions.iter().rev() {
+                    if session.last_host == *active {
+                        found_session = Some(session.last_base_url.clone());
+                        break;
+                    }
+                }
+
+                if let Some(active_base_url) = found_session {
+                    println!("  ✓ Using active host's base URL: {}", active_base_url);
+                    (active_base_url, active.clone())
+                } else {
+                    println!("  ⚠ Active host not in session history, using current");
+                    (base_url.clone(), host_name.clone())
+                }
+            } else {
+                println!("  ⚠ No session history, using current");
+                (base_url.clone(), host_name.clone())
+            }
+        } else {
+            println!("  ℹ No active host recorded, using current");
+            (base_url.clone(), host_name.clone())
+        };
+
+        println!("  Final Base URL: {}", use_base_url);
+        println!("  Final Host: {}", use_host_name);
+        println!("=====================================\n");
+
         let media_sequence = extract_media_sequence(&m3u8_text);
 
-        let modified_m3u8 = rewrite_m3u8_urls_with_host(&m3u8_text, &base_url, &host_name, &original_url, media_sequence).await;
+        let modified_m3u8 = rewrite_m3u8_urls_with_host(&m3u8_text, &use_base_url, &use_host_name, &original_url, media_sequence).await;
         response_body = modified_m3u8.into_bytes();
-        println!("Rewrote m3u8 URLs with base: {}, host: {}, seq: {:?}, new size: {} bytes", base_url, host_name, media_sequence, response_body.len());
+        println!("Rewrote m3u8 URLs with base: {}, host: {}, seq: {:?}, new size: {} bytes", use_base_url, use_host_name, media_sequence, response_body.len());
 
         let new_session = M3u8Session {
             redirect_chain: redirect_chain.clone(),
@@ -371,33 +428,140 @@ async fn handle_ts_request(ts_url: String) -> Result<Vec<u8>, String> {
     let info = ts_info.get(&ts_url).cloned();
     drop(ts_info);
 
-    if let Some((m3u8_url, _expected_seq)) = info {
+    let actual_host = extract_host_from_url(&ts_url);
+    println!("\n========== TS Request Analysis ==========");
+    println!("  TS URL: {}", ts_url);
+    println!("  Actual Host: {}", actual_host);
+
+    let m3u8_url_for_active = if let Some((ref m3u8_url, _expected_seq)) = info {
+        println!("  Associated M3U8: {}", m3u8_url);
+
+        let active_host = {
+            let active_map = ACTIVE_HOST_MAP.lock().await;
+            active_map.get(m3u8_url).cloned()
+        };
+
+        if let Some(ref active) = active_host {
+            if *active != actual_host {
+                println!("  ⚠ Host mismatch! Active={}, Actual={}", active, actual_host);
+                println!("  Attempting to switch to active host...");
+
+                let filename = extract_filename_from_url(&ts_url);
+                let query_start = ts_url.find("?");
+                let query_string = if let Some(pos) = query_start {
+                    &ts_url[pos..]
+                } else {
+                    ""
+                };
+
+                if let Some(filename) = filename {
+                    let session_map = M3U8_SESSION_MAP.lock().await;
+                    if let Some(sessions) = session_map.get(m3u8_url) {
+                        for session in sessions.iter().rev() {
+                            if session.last_host == *active {
+                                let active_base_url = &session.last_base_url;
+                                let switched_url = format!("{}{}{}", active_base_url, filename, query_string);
+
+                                println!("  Switching to active host URL: {}", switched_url);
+
+                                match fetch_url_bytes(switched_url.clone()).await {
+                                    Ok(bytes) => {
+                                        println!("  ✓ Switch successful!");
+                                        println!("==========================================\n");
+                                        return Ok(bytes);
+                                    }
+                                    Err(e) => {
+                                        println!("  ✗ Switch failed: {}, will try original", e);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                println!("  ✓ Host matches active host");
+            }
+        }
+
         let session_map = M3U8_SESSION_MAP.lock().await;
-        if let Some(sessions) = session_map.get(&m3u8_url) {
-            let actual_host = extract_host_from_url(&ts_url);
+        if let Some(sessions) = session_map.get(m3u8_url) {
+            println!("  Available Sessions: {}", sessions.len());
 
             let mut found_match = false;
-            for session in sessions.iter().rev() {
+
+            for (idx, session) in sessions.iter().enumerate().rev() {
+                println!("    Session [{}]: Host={}, BaseURL={}",
+                    idx, session.last_host, session.last_base_url);
+
                 if session.last_host == actual_host {
                     found_match = true;
+                    println!("    ✓ Host match found at session [{}]", idx);
                     break;
                 }
             }
 
             if !found_match {
-                println!("TS host not in session history: actual={}. Will try fallback if needed.", actual_host);
+                println!("  ⚠ TS host NOT in current session history");
+                println!("  Attempting to find fallback from previous sessions...");
+
+                drop(session_map);
+
+                if let Some(fallback_url) = find_fallback_url_for_ts(&ts_url).await {
+                    println!("  ✓ Fallback successful! Using: {}", fallback_url);
+
+                    let fallback_host = extract_host_from_url(&fallback_url);
+                    let mut active_map = ACTIVE_HOST_MAP.lock().await;
+                    active_map.insert(m3u8_url.clone(), fallback_host);
+                    drop(active_map);
+
+                    println!("==========================================\n");
+                    return fetch_url_bytes(fallback_url).await;
+                } else {
+                    println!("  ✗ Fallback failed, will try original URL");
+                }
+            } else {
+                println!("  ✓ Using current host (no fallback needed)");
+
+                let mut active_map = ACTIVE_HOST_MAP.lock().await;
+                active_map.insert(m3u8_url.clone(), actual_host.clone());
+                drop(active_map);
             }
+        } else {
+            println!("  ⚠ No session history found for this M3U8");
         }
-        drop(session_map);
-    }
+
+        Some(m3u8_url.clone())
+    } else {
+        println!("  ⚠ No M3U8 association found for this TS");
+        None
+    };
+
+    println!("==========================================\n");
 
     let result = fetch_url_bytes(ts_url.clone()).await;
+
+    if result.is_ok() {
+        if let Some(ref m3u8_url) = m3u8_url_for_active {
+            let mut active_map = ACTIVE_HOST_MAP.lock().await;
+            active_map.insert(m3u8_url.clone(), actual_host.clone());
+            drop(active_map);
+        }
+    }
 
     if result.is_err() {
         println!("TS fetch failed for {}, trying fallback logic", ts_url);
 
         if let Some(fallback_url) = find_fallback_url_for_ts(&ts_url).await {
             println!("Trying fallback URL: {}", fallback_url);
+
+            let fallback_host = extract_host_from_url(&fallback_url);
+            if let Some(ref m3u8_url) = m3u8_url_for_active {
+                let mut active_map = ACTIVE_HOST_MAP.lock().await;
+                active_map.insert(m3u8_url.clone(), fallback_host);
+                drop(active_map);
+            }
+
             return fetch_url_bytes(fallback_url).await;
         }
     }
@@ -509,27 +673,45 @@ async fn find_fallback_url_for_ts(ts_url: &str) -> Option<String> {
         ""
     };
 
-    for session in sessions.iter().rev() {
+    let current_host = extract_host_from_url(ts_url);
+    println!("Current TS host: {}, looking for alternative...", current_host);
+
+    for (session_idx, session) in sessions.iter().enumerate().rev() {
         let redirect_chain = &session.redirect_chain;
         let current_base_url = &session.last_base_url;
 
-        for chain_url in redirect_chain.iter().rev() {
+        println!("Checking session [{}]: Host={}", session_idx, session.last_host);
+
+        for (chain_idx, chain_url) in redirect_chain.iter().enumerate().rev() {
             let chain_base_url = extract_base_url(chain_url);
+            let chain_host = extract_host_from_url(chain_url);
 
             if chain_base_url == *current_base_url {
+                println!("  Chain [{}] skipped (same as current base): {}", chain_idx, chain_host);
+                continue;
+            }
+
+            if chain_host == current_host {
+                println!("  Chain [{}] skipped (same as current host): {}", chain_idx, chain_host);
                 continue;
             }
 
             let fallback_url = format!("{}{}{}", chain_base_url, filename, query_string);
-            println!("Trying fallback to host {}: {}", extract_host_from_url(chain_url), fallback_url);
+            println!("  Trying fallback to chain [{}] host {}: {}", chain_idx, chain_host, fallback_url);
 
-            if fetch_url_bytes(fallback_url.clone()).await.is_ok() {
-                println!("Fallback successful!");
-                return Some(fallback_url);
+            match fetch_url_bytes(fallback_url.clone()).await {
+                Ok(_) => {
+                    println!("  ✓ Fallback successful to host: {}", chain_host);
+                    return Some(fallback_url);
+                }
+                Err(e) => {
+                    println!("  ✗ Fallback failed: {}", e);
+                }
             }
         }
     }
 
+    println!("All fallback attempts failed");
     None
 }
 
