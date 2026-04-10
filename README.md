@@ -10,17 +10,17 @@
 
 - 播放m3u播放列表
 - 播放m3u8单个链接
-- EPG显示 支持xmltv diyp 格式 开发中
-- PLTV格式回放 待排期
+- EPG显示 支持xmltv diyp 格式 
+- PLTV格式回放
 - m3u播放列表 kodi回看格式 tivimate回看格式兼容 待排期
 - MCE遥控器控制兼容 待排期
 - xbox手柄控制兼容 待排期
 - rstp支持 待排期
 - rtp支持 待排期
-- mpv格式支持 待排期
+- mpd格式支持 待排期
 - 播放列表diyp txt  普通txt 等格式兼容 待排期
 - m3u DRM 支持 待排期
-- mpv DRM 支持 待排期
+- mpd DRM 支持 待排期
 
 
 
