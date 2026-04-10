@@ -159,6 +159,11 @@ const handleSelectChannel = (index: number) => {
   updateSubscription(sub);
 };
 
+const handlePlayback = (url: string) => {
+  console.log('Starting playback:', url);
+  currentStreamUrl.value = url;
+};
+
 const handleRefreshPlaylist = async () => {
   if (!activeSubscription.value || activeSubscription.value.type !== 'playlist') return;
 
@@ -316,6 +321,7 @@ const handleRefreshEPG = async (epgSub: any) => {
             :active-index="activeChannelIndex"
             :epg-subscriptions="epgSubscriptions"
             @select="handleSelectChannel"
+            @playback="handlePlayback"
         />
 
       </section>

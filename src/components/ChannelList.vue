@@ -94,6 +94,14 @@
             </div>
             <div v-if="program.desc" class="program-desc">{{ program.desc }}</div>
           </div>
+          <button
+              v-if="hasPlaybackSupport && canPlayback(program)"
+              class="btn-program-playback"
+              @click="handleProgramPlayback(program)"
+              title="回看此节目"
+          >
+            ⏮️
+          </button>
         </div>
       </div>
 
@@ -114,8 +122,9 @@ const props = defineProps<{
   epgSubscriptions?: EPGSubscription[];
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   select: [index: number];
+  playback: [url: string];
 }>();
 
 const activeTab = ref<'channels' | 'epg'>('channels');
@@ -126,6 +135,16 @@ const selectedDateOffset = ref(0);
 
 const hasEPGSupport = computed(() => {
   return props.epgSubscriptions && props.epgSubscriptions.length > 0;
+});
+
+const hasPlaybackSupport = computed(() => {
+  if (!hasEPGSupport.value || props.activeIndex === undefined) return false;
+
+  const currentChannel = props.channels[props.activeIndex];
+  if (!currentChannel) return false;
+
+  const url = currentChannel.url.toUpperCase();
+  return url.includes('PLTV') || url.includes('TVOD');
 });
 
 const currentChannelName = computed(() => {
@@ -171,6 +190,17 @@ const isCurrentProgram = (program: any) => {
   const endTime = program.end;
 
   return startTime <= currentTime && endTime >= currentTime;
+};
+
+const canPlayback = (program: any) => {
+  if (selectedDateOffset.value !== 0) return false;
+
+  const now = new Date();
+  const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+  const endTime = program.end;
+
+  return endTime <= currentTime;
 };
 
 const changeDate = (delta: number) => {
@@ -310,6 +340,35 @@ watch(() => props.activeIndex, () => {
 const handleImageError = (e: Event) => {
   const target = e.target as HTMLImageElement;
   target.style.display = 'none';
+};
+
+const handleProgramPlayback = (program: any) => {
+  if (props.activeIndex === undefined || !props.channels[props.activeIndex]) return;
+
+  const currentChannel = props.channels[props.activeIndex];
+
+  try {
+    const baseUrl = currentChannel.url.split('?')[0];
+
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+
+    const startParts = program.start.split(':');
+    const endParts = program.end.split(':');
+
+    const startTime = `${year}${month}${day}${startParts[0]}${startParts[1]}00`;
+    const endTime = `${year}${month}${day}${endParts[0]}${endParts[1]}00`;
+
+    const playbackUrl = `${baseUrl}?playseek=${startTime}-${endTime}`;
+
+    console.log('Playback URL:', playbackUrl);
+    emit('playback', playbackUrl);
+  } catch (e) {
+    console.error('Failed to generate playback URL:', e);
+    error.value = '生成回看地址失败';
+  }
 };
 </script>
 
@@ -525,6 +584,7 @@ const handleImageError = (e: Event) => {
   border-radius: 6px;
   transition: all 0.2s;
   border-left: 3px solid transparent;
+  align-items: center;
 }
 
 .program-item.is-current {
@@ -581,5 +641,26 @@ const handleImageError = (e: Event) => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.btn-program-playback {
+  padding: 6px 10px;
+  background: #8b5cf6;
+  border: none;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.btn-program-playback:hover {
+  background: #7c3aed;
+  transform: scale(1.1);
+}
+
+.btn-program-playback:active {
+  transform: scale(0.95);
 }
 </style>
