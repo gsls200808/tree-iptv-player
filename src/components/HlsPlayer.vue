@@ -67,7 +67,8 @@ const initPlayer = async () => {
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
-              error.value = '网络错误，请检查流地址是否正确';
+              // error.value = '网络错误，请检查流地址是否正确';
+              // 不显示错误提示，静默重试
               loading.value = false;
               setTimeout(() => {
                 if (hls) {
