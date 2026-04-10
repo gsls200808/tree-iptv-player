@@ -193,7 +193,11 @@ const isCurrentProgram = (program: any) => {
 };
 
 const canPlayback = (program: any) => {
-  if (selectedDateOffset.value !== 0) return false;
+  if (selectedDateOffset.value > 0) return false;
+
+  if (selectedDateOffset.value < 0) {
+    return true;
+  }
 
   const now = new Date();
   const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -350,10 +354,10 @@ const handleProgramPlayback = (program: any) => {
   try {
     const baseUrl = currentChannel.url.split('?')[0];
 
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
+    const targetDate = selectedDate.value;
+    const year = targetDate.getFullYear();
+    const month = String(targetDate.getMonth() + 1).padStart(2, '0');
+    const day = String(targetDate.getDate()).padStart(2, '0');
 
     const startParts = program.start.split(':');
     const endParts = program.end.split(':');
