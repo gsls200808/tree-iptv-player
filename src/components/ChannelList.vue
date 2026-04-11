@@ -3,14 +3,21 @@
     <div class="channel-list-header">
       <h4>频道列表 ({{ channels.length }})</h4>
 
-      <div v-if="hasEPGSupport" class="tab-buttons">
+      <div class="tab-buttons">
         <button
-            :class="['tab-btn', { active: activeTab === 'channels' }]"
-            @click="activeTab = 'channels'"
+            :class="['tab-btn', { active: displayMode === 'all' && activeTab === 'channels' }]"
+            @click="displayMode = 'all'; activeTab = 'channels'"
         >
-          📺 频道
+          📺 全部
         </button>
         <button
+            :class="['tab-btn', { active: displayMode === 'group' && activeTab === 'channels' }]"
+            @click="displayMode = 'group'; activeTab = 'channels'"
+        >
+          📁 分组
+        </button>
+        <button
+            v-if="hasEPGSupport"
             :class="['tab-btn', { active: activeTab === 'epg' }]"
             @click="activeTab = 'epg'"
         >
@@ -19,7 +26,7 @@
       </div>
     </div>
 
-    <div v-if="activeTab === 'channels'" class="channels">
+    <div v-if="activeTab === 'channels' && displayMode === 'all'" class="channels">
       <div
           v-for="(channel, index) in channels"
           :key="index"
@@ -36,6 +43,52 @@
         <div class="channel-info">
           <div class="channel-name">{{ channel.name }}</div>
           <div v-if="channel.group" class="channel-group">{{ channel.group }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div v-else-if="activeTab === 'channels' && displayMode === 'group'" class="groups">
+      <div v-if="!selectedGroup" class="group-list">
+        <div
+            v-for="(groupChannels, groupName) in groupedChannels"
+            :key="groupName"
+            class="group-item"
+            @click="selectedGroup = groupName"
+        >
+          <div class="group-icon">📁</div>
+          <div class="group-info">
+            <div class="group-name">{{ groupName }}</div>
+            <div class="group-count">{{ groupChannels.length }} 个频道</div>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="group-channels">
+        <div class="group-header">
+          <button class="btn-back" @click="selectedGroup = null">
+            ◀ 返回分组列表
+          </button>
+          <h5>{{ selectedGroup }} ({{ groupedChannels[selectedGroup]?.length || 0 }})</h5>
+        </div>
+
+        <div class="channels">
+          <div
+              v-for="(channel, index) in groupedChannels[selectedGroup]"
+              :key="channel.originalIndex"
+              :class="['channel-item', { active: channel.originalIndex === activeIndex }]"
+              @click="$emit('select', channel.originalIndex)"
+          >
+            <img
+                v-if="channel.logo"
+                :src="channel.logo"
+                :alt="channel.name"
+                class="channel-logo"
+                @error="handleImageError"
+            />
+            <div class="channel-info">
+              <div class="channel-name">{{ channel.name }}</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -128,6 +181,8 @@ const emit = defineEmits<{
 }>();
 
 const activeTab = ref<'channels' | 'epg'>('channels');
+const displayMode = ref<'all' | 'group'>('all');
+const selectedGroup = ref<string | null>(null);
 const loading = ref(false);
 const error = ref<string>('');
 const diypPrograms = ref<any[]>([]);
@@ -153,6 +208,24 @@ const currentChannelName = computed(() => {
   }
   return '';
 });
+
+const groupedChannels = computed(() => {
+  const groups: Record<string, Array<ChannelItem & { originalIndex: number }>> = {};
+
+  props.channels.forEach((channel, index) => {
+    const groupName = channel.group || '未分组';
+    if (!groups[groupName]) {
+      groups[groupName] = [];
+    }
+    groups[groupName].push({
+      ...channel,
+      originalIndex: index
+    });
+  });
+
+  return groups;
+});
+
 
 const selectedDate = computed(() => {
   const now = new Date();
@@ -341,6 +414,10 @@ watch(() => props.activeIndex, () => {
   }
 });
 
+watch(displayMode, () => {
+  selectedGroup.value = null;
+});
+
 const handleImageError = (e: Event) => {
   const target = e.target as HTMLImageElement;
   target.style.display = 'none';
@@ -376,8 +453,7 @@ const handleProgramPlayback = (program: any) => {
 };
 </script>
 
-<style scoped>
-.channel-list {
+<style scoped>.channel-list {
   background: var(--card-bg);
   border-radius: 8px;
   padding: 20px;
@@ -475,6 +551,85 @@ const handleProgramPlayback = (program: any) => {
 .channel-group {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.groups {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.group-item {
+  display: flex;
+  align-items: center;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 2px solid transparent;
+}
+
+.group-item:hover {
+  background: var(--border-color);
+  border-color: #3b82f6;
+}
+
+.group-icon {
+  font-size: 24px;
+  margin-right: 12px;
+}
+
+.group-info {
+  flex: 1;
+}
+
+.group-name {
+  font-weight: 500;
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+
+.group-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.group-channels {
+  display: flex;
+  flex-direction: column;
+}
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.btn-back {
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+
+.btn-back:hover {
+  background: var(--border-color);
+}
+
+.group-header h5 {
+  margin: 0;
+  flex: 1;
 }
 
 .epg-tab {
