@@ -73,7 +73,7 @@
 
         <div class="channels">
           <div
-              v-for="(channel, index) in groupedChannels[selectedGroup]"
+              v-for="(channel) in groupedChannels[selectedGroup]"
               :key="channel.originalIndex"
               :class="['channel-item', { active: channel.originalIndex === activeIndex }]"
               @click="$emit('select', channel.originalIndex)"
