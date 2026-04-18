@@ -49,6 +49,23 @@ async fn fetch_url_content(url: String) -> Result<String, String> {
     Ok(text)
 }
 
+/// Resolve a stream URL that may 302 redirect (e.g. vodId URLs).
+/// Returns the final URL after following all redirects.
+#[command]
+async fn resolve_stream_url(url: String) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let response = client.get(&url).send().await
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    let final_url = response.url().to_string();
+    println!("Resolved: {} -> {}", url, final_url);
+    Ok(final_url)
+}
+
 async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -271,9 +288,10 @@ async fn handle_proxy_request(
 
     println!("Proxying request to: {}", full_url);
 
-    let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u") || full_url.contains("vodId=");
+    let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u");
 
     if is_m3u8 {
+        // HLS m3u8: buffer and rewrite URLs
         match handle_m3u8_request(full_url.clone()).await {
             Ok((response_body, redirect_chain)) => {
                 println!("Successfully fetched {} bytes", response_body.len());
@@ -305,7 +323,106 @@ async fn handle_proxy_request(
             }
         }
     } else {
-        match handle_ts_request(full_url.clone()).await {
+        // For non-m3u8 URLs: follow redirects to detect actual content type
+        // (handles vodId URLs that redirect to .flv or .m3u8)
+        let client = match reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(format!("Failed to create client: {}", e)))
+                    .unwrap());
+            }
+        };
+
+        let mut check_url = full_url.clone();
+        let mut is_final_flv = false;
+
+        // Follow redirects to find the final URL
+        for _ in 0..10 {
+            let resp = match client.get(&check_url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Redirect check failed: {}", e);
+                    break;
+                }
+            };
+
+            if resp.status().is_redirection() {
+                if let Some(location) = resp.headers().get("location") {
+                    let loc = location.to_str().unwrap_or("");
+                    check_url = if loc.starts_with("http") {
+                        loc.to_string()
+                    } else {
+                        let base = extract_base_url(&check_url);
+                        format!("{}{}", base, loc)
+                    };
+                    if check_url.contains(".flv") {
+                        is_final_flv = true;
+                        break;
+                    }
+                    if check_url.contains(".m3u8") || check_url.contains(".m3u") {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                // Check content-type as fallback
+                if let Some(ct) = resp.headers().get("content-type") {
+                    let ct_str = ct.to_str().unwrap_or("");
+                    if ct_str.contains("video/x-flv") {
+                        is_final_flv = true;
+                    }
+                }
+                break;
+            }
+        }
+
+        if is_final_flv || check_url.contains(".flv") {
+            // FLV stream: proxy with proper headers
+            match handle_flv_proxy_request(full_url.clone()).await {
+                Ok(response) => {
+                    println!("FLV streaming started for: {}", full_url);
+                    Ok(response)
+                }
+                Err(e) => {
+                    eprintln!("FLV proxy error: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Body::from(format!("FLV proxy error: {}", e)))
+                        .unwrap())
+                }
+            }
+        } else if check_url.contains(".m3u8") || check_url.contains(".m3u") {
+            // Redirected to m3u8: handle as HLS
+            match handle_m3u8_request(check_url.clone()).await {
+                Ok((response_body, _)) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header("Cache-Control", "no-cache")
+                        .body(Body::from(response_body))
+                        .unwrap())
+                }
+                Err(e) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Body::from(format!("Proxy error: {}", e)))
+                        .unwrap())
+                }
+            }
+        } else {
+            // Regular TS segment
+            match handle_ts_request(full_url.clone()).await {
             Ok(bytes) => {
                 let content_type = if full_url.contains(".ts") {
                     "video/MP2T"
@@ -338,7 +455,88 @@ async fn handle_proxy_request(
                     .unwrap())
             }
         }
+        }  // close: else (TS handler)
+    }  // close: outer if/else (m3u8 vs other)
+}
+
+async fn handle_flv_proxy_request(original_url: String) -> Result<Response<Body>, String> {
+    // Step 1: Resolve redirect (vodId -> final CDN URL)
+    let redirect_client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Client error: {}", e))?;
+
+    let mut current_url = original_url.clone();
+    for _ in 0..10 {
+        let resp = redirect_client.get(&current_url).send().await
+            .map_err(|e| format!("Redirect fetch failed: {}", e))?;
+        if resp.status().is_redirection() {
+            if let Some(loc) = resp.headers().get("location") {
+                let loc_str = loc.to_str().unwrap_or("");
+                current_url = if loc_str.starts_with("http") {
+                    loc_str.to_string()
+                } else {
+                    format!("{}{}", extract_base_url(&current_url), loc_str)
+                };
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
+
+    println!("\n========== FLV Stream (curl subprocess) ==========");
+    println!("  Original: {}", original_url);
+    println!("  Final:    {}", current_url);
+    println!("==================================================\n");
+
+    // Spawn curl to stream the FLV data (curl handles Connection: Close correctly)
+    let mut child = tokio::process::Command::new("curl")
+        .arg("-s")
+        .arg("-N")
+        .arg(&current_url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+
+    let stdout = child.stdout.take()
+        .ok_or("Failed to get curl stdout")?;
+
+    let (mut tx, body) = Body::channel();
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stdout = stdout;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send_data(bytes::Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FLV curl read error: {}", e);
+                    break;
+                }
+            }
+        }
+        child.kill().await.ok();
+        println!("FLV stream ended for: {}", original_url);
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "video/x-flv")
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header("Cache-Control", "no-cache")
+        .header("Transfer-Encoding", "chunked")
+        .body(body)
+        .unwrap())
 }
 
 async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<String>), String> {
@@ -569,7 +767,6 @@ async fn handle_ts_request(ts_url: String) -> Result<Vec<u8>, String> {
     result
 }
 
-
 fn extract_base_url(final_url: &str) -> String {
     let url_without_query = if let Some(pos) = final_url.find("?") {
         &final_url[..pos]
@@ -737,6 +934,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             fetch_url_content,
+            resolve_stream_url,
             proxy_hls_request,
             cache_and_get_local_url,
             start_hls_proxy_server

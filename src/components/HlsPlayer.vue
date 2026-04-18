@@ -9,6 +9,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue';
 import Hls from 'hls.js';
+import mpegts from 'mpegts.js';
 import { getProxyUrl } from '../utils/tauriApi';
 
 const props = defineProps<{
@@ -19,93 +20,213 @@ const videoElement = ref<HTMLVideoElement | null>(null);
 const error = ref<string>('');
 const loading = ref(true);
 let hls: Hls | null = null;
+let flvPlayer: any = null;
 
-const initPlayer = async () => {
-  if (!videoElement.value) return;
+// Determine stream type from URL
+// vodId URLs: check the API path (/fhx/ = FLV, others = HLS)
+// Direct URLs: check file extension
+function getStreamType(url: string): 'flv' | 'hls' {
+  const lower = url.toLowerCase();
+  // Direct .flv URL
+  if (lower.includes('.flv')) return 'flv';
+  // vodId API paths that are known to serve FLV
+  if (lower.includes('vodid=') && (lower.includes('/fhx/') || lower.includes('/fh'))) {
+    return 'flv';
+  }
+  return 'hls';
+}
 
+const destroyPlayers = () => {
   if (hls) {
     hls.destroy();
     hls = null;
   }
+  if (flvPlayer) {
+    try {
+      flvPlayer.pause();
+      flvPlayer.unload();
+      flvPlayer.detachMediaElement();
+      flvPlayer.destroy();
+    } catch (e) {
+      console.warn('Error destroying FLV player:', e);
+    }
+    flvPlayer = null;
+  }
+};
 
-  error.value = '';
-  loading.value = true;
+const initFlvPlayer = async (streamUrl: string) => {
+  if (!videoElement.value) return;
 
   const video = videoElement.value;
 
-  try {
-    let streamUrl = props.src;
+  if (!mpegts.isSupported()) {
+    error.value = '您的浏览器不支持 FLV 播放';
+    loading.value = false;
+    return;
+  }
 
-    if (props.src.startsWith('http://') || props.src.startsWith('https://')) {
+  flvPlayer = mpegts.createPlayer(
+    {
+      type: 'flv',
+      isLive: true,
+      url: streamUrl,
+    },
+    {
+      enableStashBuffer: false,
+      lazyLoad: false,
+      autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 15,
+      autoCleanupMinBackwardDuration: 10,
+    }
+  );
+
+  flvPlayer.attachMediaElement(video);
+  flvPlayer.load();
+
+  let metadataReceived = false;
+
+  const tryPlay = () => {
+    // Muted autoplay is always allowed by browsers
+    video.muted = true;
+    video
+      .play()
+      .then(() => {
+        console.log('FLV autoplay started (muted)');
+        // Unmute after playback begins
+        setTimeout(() => {
+          video.muted = false;
+        }, 100);
+      })
+      .catch((e) => {
+        console.log('Auto-play failed:', e);
+      });
+  };
+
+  flvPlayer.on(mpegts.Events.METADATA_ARRIVED, () => {
+    if (!metadataReceived) {
+      console.log('FLV metadata loaded');
+      metadataReceived = true;
+      loading.value = false;
+      tryPlay();
+    }
+  });
+
+  flvPlayer.on(mpegts.Events.STATISTICS_INFO, () => {
+    if (!metadataReceived) {
+      metadataReceived = true;
+      loading.value = false;
+      tryPlay();
+    }
+  });
+
+  flvPlayer.on(mpegts.Events.ERROR, (errorType: string, errorDetail: string, errorInfo: any) => {
+    console.error('FLV error:', errorType, errorDetail, errorInfo);
+    if (errorType === 'NetworkError') {
+      loading.value = false;
+    }
+  });
+
+  setTimeout(() => {
+    if (!metadataReceived) {
+      metadataReceived = true;
+      loading.value = false;
+      tryPlay();
+    }
+  }, 5000);
+};
+
+const initHlsPlayer = async (streamUrl: string) => {
+  if (!videoElement.value) return;
+
+  const video = videoElement.value;
+
+  if (Hls.isSupported()) {
+    hls = new Hls({
+      lowLatencyMode: false,
+      backBufferLength: 90,
+    });
+
+    hls.loadSource(streamUrl);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      console.log('HLS manifest loaded');
+      loading.value = false;
+      video.play().catch((e) => {
+        console.log('Auto-play prevented:', e);
+      });
+    });
+
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      console.error('HLS error:', data);
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            loading.value = false;
+            setTimeout(() => {
+              if (hls) hls.startLoad();
+            }, 3000);
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            error.value = '媒体错误，尝试恢复...';
+            hls?.recoverMediaError();
+            break;
+          default:
+            error.value = '播放失败，无法恢复';
+            loading.value = false;
+            hls?.destroy();
+            break;
+        }
+      }
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = streamUrl;
+    video.addEventListener('loadedmetadata', () => {
+      loading.value = false;
+      video.play().catch((e) => {
+        console.log('Auto-play prevented:', e);
+      });
+    });
+    video.addEventListener('error', () => {
+      error.value = '视频加载失败';
+      loading.value = false;
+    });
+  } else {
+    error.value = '您的浏览器不支持 HLS 播放';
+    loading.value = false;
+  }
+};
+
+const initPlayer = async () => {
+  if (!videoElement.value) return;
+
+  destroyPlayers();
+  error.value = '';
+  loading.value = true;
+
+  try {
+    const originalUrl = props.src;
+    const streamType = getStreamType(originalUrl);
+
+    // All URLs go through proxy — it follows redirects and detects content type
+    let playUrl = originalUrl;
+    if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
       try {
-        streamUrl = await getProxyUrl(props.src);
-        console.log('Using proxy URL:', streamUrl);
+        playUrl = await getProxyUrl(originalUrl);
       } catch (e) {
-        console.warn('Failed to get proxy URL, using original:', e);
+        console.warn('Proxy unavailable, using original URL:', e);
       }
     }
 
-    if (Hls.isSupported()) {
-      hls = new Hls({
-        lowLatencyMode: false,
-        backBufferLength: 90,
-      });
+    console.log(`Stream type: ${streamType}, URL: ${playUrl}`);
 
-      hls.loadSource(streamUrl);
-      hls.attachMedia(video);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        console.log('HLS manifest loaded');
-        loading.value = false;
-        video.play().catch(e => {
-          console.log('Auto-play prevented:', e);
-        });
-      });
-
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        console.error('HLS error:', data);
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              // error.value = '网络错误，请检查流地址是否正确';
-              // 不显示错误提示，静默重试
-              loading.value = false;
-              setTimeout(() => {
-                if (hls) {
-                  hls.startLoad();
-                }
-              }, 3000);
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              error.value = '媒体错误，尝试恢复...';
-              hls?.recoverMediaError();
-              break;
-            default:
-              error.value = '播放失败，无法恢复';
-              loading.value = false;
-              hls?.destroy();
-              break;
-          }
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = streamUrl;
-      video.addEventListener('loadedmetadata', () => {
-        loading.value = false;
-        video.play().catch(e => {
-          console.log('Auto-play prevented:', e);
-        });
-      });
-      video.addEventListener('error', () => {
-        error.value = '视频加载失败';
-        loading.value = false;
-      });
+    if (streamType === 'flv') {
+      await initFlvPlayer(playUrl);
     } else {
-      error.value = '您的浏览器不支持 HLS 播放';
-      loading.value = false;
+      await initHlsPlayer(playUrl);
     }
   } catch (e) {
-    console.error('Player initialization error:', e);
+    console.error('Player init error:', e);
     error.value = '播放器初始化失败';
     loading.value = false;
   }
@@ -115,15 +236,15 @@ onMounted(() => {
   initPlayer();
 });
 
-watch(() => props.src, () => {
-  initPlayer();
-});
+watch(
+  () => props.src,
+  () => {
+    initPlayer();
+  }
+);
 
 onBeforeUnmount(() => {
-  if (hls) {
-    hls.destroy();
-    hls = null;
-  }
+  destroyPlayers();
 });
 </script>
 
@@ -167,4 +288,3 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 </style>
-

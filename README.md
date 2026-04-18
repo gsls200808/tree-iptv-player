@@ -12,6 +12,7 @@
 - 播放m3u8单个链接
 - EPG显示 支持xmltv diyp 格式 
 - PLTV格式回放
+- HTTP-FLV 支持
 - m3u播放列表 kodi回看格式 tivimate回看格式兼容 待排期
 - MCE遥控器控制兼容 待排期
 - xbox手柄控制兼容 待排期

@@ -213,7 +213,7 @@ const handleRefreshEPG = async (epgSub: any) => {
 <template>
   <main class="app-container">
     <header class="app-header">
-      <h1>📺 HLS 流媒体播放器</h1>
+      <h1>📺 IPTV 播放器</h1>
     </header>
 
     <div class="app-content">
