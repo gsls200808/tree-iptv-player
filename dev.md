@@ -49,12 +49,12 @@ git push
 触发构建
 
 ```
-Cargo.toml 文件的version = "0.1.6" 改成对应版本
+Cargo.toml 文件的version = "0.1.7" 改成对应版本
 # 触发
-git tag -d v0.1.6
-git push origin --delete v0.1.6
-git tag v0.1.6
-git push origin v0.1.6
+git tag -d v0.1.7
+git push origin --delete v0.1.7
+git tag v0.1.7
+git push origin v0.1.7
 
 ```
 
