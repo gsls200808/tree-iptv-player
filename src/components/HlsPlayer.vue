@@ -10,7 +10,7 @@
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
-import { getProxyUrl } from '../utils/tauriApi';
+import { getProxyUrl, startRtspProxy, stopRtspProxy } from '../utils/tauriApi';
 
 const props = defineProps<{
   src: string;
@@ -21,12 +21,12 @@ const error = ref<string>('');
 const loading = ref(true);
 let hls: Hls | null = null;
 let flvPlayer: any = null;
+let currentRtspUrl: string | null = null;
 
 // Determine stream type from URL
-// vodId URLs: check the API path (/fhx/ = FLV, others = HLS)
-// Direct URLs: check file extension
-function getStreamType(url: string): 'flv' | 'hls' {
+function getStreamType(url: string): 'flv' | 'hls' | 'rtsp' {
   const lower = url.toLowerCase();
+  if (lower.startsWith('rtsp://')) return 'rtsp';
   // Direct .flv URL
   if (lower.includes('.flv')) return 'flv';
   // vodId API paths that are known to serve FLV
@@ -51,6 +51,12 @@ const destroyPlayers = () => {
       console.warn('Error destroying FLV player:', e);
     }
     flvPlayer = null;
+  }
+  if (currentRtspUrl) {
+    stopRtspProxy(currentRtspUrl).catch((e) => {
+      console.warn('Error stopping RTSP proxy:', e);
+    });
+    currentRtspUrl = null;
   }
 };
 
@@ -208,9 +214,23 @@ const initPlayer = async () => {
     const originalUrl = props.src;
     const streamType = getStreamType(originalUrl);
 
-    // All URLs go through proxy — it follows redirects and detects content type
     let playUrl = originalUrl;
-    if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
+
+    if (streamType === 'rtsp') {
+      // RTSP: start backend FFmpeg proxy, get local HLS URL
+      try {
+        console.log('Starting RTSP proxy for:', originalUrl);
+        playUrl = await startRtspProxy(originalUrl);
+        currentRtspUrl = originalUrl;
+        console.log('RTSP proxy URL:', playUrl);
+      } catch (e) {
+        console.error('RTSP proxy failed:', e);
+        error.value = 'RTSP 代理启动失败，请确认已安装 FFmpeg';
+        loading.value = false;
+        return;
+      }
+    } else if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
+      // HTTP(S) URLs go through proxy — it follows redirects and detects content type
       try {
         playUrl = await getProxyUrl(originalUrl);
       } catch (e) {
@@ -223,6 +243,7 @@ const initPlayer = async () => {
     if (streamType === 'flv') {
       await initFlvPlayer(playUrl);
     } else {
+      // Both HLS and RTSP (transcoded to HLS) play through the HLS player
       await initHlsPlayer(playUrl);
     }
   } catch (e) {

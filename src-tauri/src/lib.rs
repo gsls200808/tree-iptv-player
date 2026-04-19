@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode, Method};
@@ -26,6 +27,8 @@ lazy_static::lazy_static! {
     static ref M3U8_SESSION_MAP: Mutex<HashMap<String, Vec<M3u8Session>>> = Mutex::new(HashMap::new());
     static ref TS_TO_M3U8_MAP: Mutex<HashMap<String, (String, u64)>> = Mutex::new(HashMap::new());
     static ref ACTIVE_HOST_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static ref RTSP_PROCESSES: Mutex<HashMap<String, tokio::process::Child>> = Mutex::new(HashMap::new());
+    static ref RTSP_PORTS: Mutex<HashMap<String, u16>> = Mutex::new(HashMap::new());
 }
 
 #[command]
@@ -927,6 +930,179 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
     }
 }
 
+async fn serve_hls_file(
+    req: Request<Body>,
+    hls_dir: Arc<PathBuf>,
+) -> Result<Response<Body>, Infallible> {
+    let path = req.uri().path().trim_start_matches('/');
+    let file_path = if path.is_empty() {
+        hls_dir.join("playlist.m3u8")
+    } else {
+        hls_dir.join(path)
+    };
+
+    match tokio::fs::read(&file_path).await {
+        Ok(contents) => {
+            let ct = if file_path.extension().map_or(false, |e| e == "m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "video/mp2t"
+            };
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, ct)
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("Cache-Control", "no-cache")
+                .body(Body::from(contents))
+                .unwrap())
+        }
+        Err(_) => {
+            // Retry for m3u8 (ffmpeg may not have created it yet)
+            if path.is_empty() || path.ends_with(".m3u8") {
+                for _ in 0..10 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    if let Ok(contents) = tokio::fs::read(&file_path).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .header("Cache-Control", "no-cache")
+                            .body(Body::from(contents))
+                            .unwrap());
+                    }
+                }
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from("m3u8 not ready, ffmpeg may have failed"))
+                    .unwrap())
+            } else {
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from("File not found"))
+                    .unwrap())
+            }
+        }
+    }
+}
+
+#[command]
+async fn start_rtsp_proxy(rtsp_url: String) -> Result<u16, String> {
+    // Check if already running
+    {
+        let ports = RTSP_PORTS.lock().await;
+        if let Some(&port) = ports.get(&rtsp_url) {
+            return Ok(port);
+        }
+    }
+
+    // Stop any existing process for this URL
+    stop_rtsp_proxy_internal(&rtsp_url).await;
+
+    // Create temp directory for HLS output
+    let hls_dir = std::env::temp_dir().join(format!(
+        "rtsp_hls_{}",
+        rtsp_url.replace(&['/', ':', '.', '?', '&', '='][..], "_")
+    ));
+    tokio::fs::create_dir_all(&hls_dir)
+        .await
+        .map_err(|e| format!("Failed to create HLS dir: {}", e))?;
+
+    let playlist_path = hls_dir.join("playlist.m3u8");
+    let segment_pattern = hls_dir.join("stream%05d.ts");
+
+    println!("RTSP proxy: dir={}", hls_dir.display());
+
+    // Start FFmpeg: RTSP -> HLS (TS segments)
+    let child = tokio::process::Command::new("ffmpeg")
+        .arg("-rtsp_transport")
+        .arg("tcp")
+        .arg("-i")
+        .arg(&rtsp_url)
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-f")
+        .arg("hls")
+        .arg("-hls_time")
+        .arg("2")
+        .arg("-hls_list_size")
+        .arg("5")
+        .arg("-hls_flags")
+        .arg("delete_segments")
+        .arg("-hls_segment_type")
+        .arg("mpegts")
+        .arg("-hls_segment_filename")
+        .arg(segment_pattern.to_str().unwrap())
+        .arg(playlist_path.to_str().unwrap())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}. Is ffmpeg installed?", e))?;
+
+    // Start HTTP server for HLS files
+    let server_dir = Arc::new(hls_dir);
+    let make_svc = make_service_fn(move |_conn| {
+        let dir = server_dir.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                serve_hls_file(req, dir.clone())
+            }))
+        }
+    });
+
+    let addr = ([127, 0, 0, 1], 0).into();
+    let server = Server::bind(&addr).serve(make_svc);
+    let port = server.local_addr().port();
+
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            eprintln!("RTSP HLS server error: {}", e);
+        }
+    });
+
+    // Store process and port
+    {
+        let mut processes = RTSP_PROCESSES.lock().await;
+        processes.insert(rtsp_url.clone(), child);
+    }
+    {
+        let mut ports = RTSP_PORTS.lock().await;
+        ports.insert(rtsp_url.clone(), port);
+    }
+
+    println!("RTSP proxy ready: {} -> http://127.0.0.1:{}/", rtsp_url, port);
+    Ok(port)
+}
+
+async fn stop_rtsp_proxy_internal(rtsp_url: &str) {
+    let mut processes = RTSP_PROCESSES.lock().await;
+    if let Some(mut child) = processes.remove(rtsp_url) {
+        let _ = child.start_kill();
+        println!("Killed FFmpeg for: {}", rtsp_url);
+    }
+    drop(processes);
+
+    let mut ports = RTSP_PORTS.lock().await;
+    ports.remove(rtsp_url);
+    drop(ports);
+
+    // Clean up temp directory
+    let hls_dir = std::env::temp_dir().join(format!(
+        "rtsp_hls_{}",
+        rtsp_url.replace(&['/', ':', '.', '?', '&', '='][..], "_")
+    ));
+    let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+}
+
+#[command]
+async fn stop_rtsp_proxy(rtsp_url: String) -> Result<(), String> {
+    stop_rtsp_proxy_internal(&rtsp_url).await;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -937,7 +1113,9 @@ pub fn run() {
             resolve_stream_url,
             proxy_hls_request,
             cache_and_get_local_url,
-            start_hls_proxy_server
+            start_hls_proxy_server,
+            start_rtsp_proxy,
+            stop_rtsp_proxy
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

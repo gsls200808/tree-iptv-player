@@ -131,7 +131,7 @@ export async function detectStreamType(url: string): Promise<'single' | 'playlis
             if (line.includes(',') && !line.startsWith('#')) {
                 const parts = line.split(',');
                 // 检查是否是 名称,URL 格式
-                if (parts.length >= 2 && parts[1].trim().startsWith('http')) {
+                if (parts.length >= 2 && (parts[1].trim().startsWith('http') || parts[1].trim().startsWith('rtsp://'))) {
                     commaLineCount++;
                     // 如果找到至少两行这样的格式，判定为播放列表
                     if (commaLineCount >= 2) {
@@ -149,7 +149,7 @@ export async function detectStreamType(url: string): Promise<'single' | 'playlis
                 const nextLine = lines[i + 1];
 
                 if (nextLine && !nextLine.startsWith('#')) {
-                    if (nextLine.startsWith('http://') || nextLine.startsWith('https://')) {
+                    if (nextLine.startsWith('http://') || nextLine.startsWith('https://') || nextLine.startsWith('rtsp://')) {
                         return 'playlist';
                     } else {
                         return 'single';

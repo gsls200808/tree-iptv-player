@@ -46,3 +46,14 @@ export async function getProxyUrl(originalUrl: string): Promise<string> {
     return `http://127.0.0.1:${proxyServerPort}/proxy/${encodedUrl}`;
 }
 
+export async function startRtspProxy(rtspUrl: string): Promise<string> {
+    const port = await invoke<number>('start_rtsp_proxy', { rtspUrl });
+    console.log('RTSP proxy started on port:', port);
+    return `http://127.0.0.1:${port}/playlist.m3u8`;
+}
+
+export async function stopRtspProxy(rtspUrl: string): Promise<void> {
+    await invoke('stop_rtsp_proxy', { rtspUrl });
+    console.log('RTSP proxy stopped for:', rtspUrl);
+}
+
