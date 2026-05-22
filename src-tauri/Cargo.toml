@@ -25,3 +25,5 @@ lazy_static = "1.4"
 hyper = { version = "0.14", features = ["full"] }
 urlencoding = "2.1"
 bytes = "1"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }

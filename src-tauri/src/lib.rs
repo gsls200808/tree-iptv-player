@@ -10,6 +10,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode, Method};
 use hyper::header::{CONTENT_TYPE, ACCESS_CONTROL_ALLOW_ORIGIN};
 use std::convert::Infallible;
+use futures_util::TryStreamExt;
 
 struct M3u8Session {
     redirect_chain: Vec<String>,
@@ -490,56 +491,117 @@ async fn handle_flv_proxy_request(original_url: String) -> Result<Response<Body>
         }
     }
 
-    println!("\n========== FLV Stream (curl subprocess) ==========");
+    println!("\n========== FLV Stream (curl with hidden window) ==========");
     println!("  Original: {}", original_url);
     println!("  Final:    {}", current_url);
     println!("==================================================\n");
 
-    // Spawn curl to stream the FLV data (curl handles Connection: Close correctly)
-    let mut child = tokio::process::Command::new("curl")
-        .arg("-s")
-        .arg("-N")
-        .arg(&current_url)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn curl: {}", e))?;
-
-    let stdout = child.stdout.take()
-        .ok_or("Failed to get curl stdout")?;
-
-    let (mut tx, body) = Body::channel();
-
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut stdout = stdout;
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send_data(bytes::Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+    // Platform-specific curl spawning and streaming
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        
+        let mut child = std::process::Command::new("curl")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("-s")
+            .arg("-N")
+            .arg("--connect-timeout")
+            .arg("30")
+            .arg(&current_url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+        
+        let stdout = child.stdout.take().ok_or("Failed to get curl stdout")?;
+        
+        let (mut tx, body) = Body::channel();
+        
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut stdout = stdout;
+            let mut buf = vec![0u8; 65536];
+            let mut total_bytes: u64 = 0;
+            let mut chunk_count: u64 = 0;
+            
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => {
+                        println!("FLV stream EOF after {} chunks, {} bytes", chunk_count, total_bytes);
+                        break;
+                    }
+                    Ok(n) => {
+                        total_bytes += n as u64;
+                        chunk_count += 1;
+                        
+                        if chunk_count <= 5 || chunk_count % 100 == 0 {
+                            println!("FLV chunk #{}: {} bytes (total: {} bytes)", 
+                                chunk_count, n, total_bytes);
+                        }
+                        
+                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                        if tokio::runtime::Handle::current().block_on(tx.send_data(data)).is_err() {
+                            println!("FLV channel closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("FLV curl read error: {}", e);
                         break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("FLV curl read error: {}", e);
-                    break;
-                }
             }
-        }
-        child.kill().await.ok();
-        println!("FLV stream ended for: {}", original_url);
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "video/x-flv")
-        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header("Cache-Control", "no-cache")
-        .header("Transfer-Encoding", "chunked")
-        .body(body)
-        .unwrap())
+            
+            println!("FLV stream ended (total: {} bytes in {} chunks)", total_bytes, chunk_count);
+        });
+        
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "video/x-flv")
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("Cache-Control", "no-cache")
+            .header("Transfer-Encoding", "chunked")
+            .body(body)
+            .unwrap());
+    }
+    
+    // Non-Windows: use tokio process with ReaderStream
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut child = tokio::process::Command::new("curl")
+            .arg("-s")
+            .arg("-N")
+            .arg("--connect-timeout")
+            .arg("30")
+            .arg(&current_url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+        
+        let stdout = child.stdout.take().ok_or("Failed to get curl stdout")?;
+        
+        use tokio_util::io::ReaderStream;
+        let reader_stream = ReaderStream::new(stdout);
+        
+        let body = Body::wrap_stream(reader_stream.map_ok(|chunk: bytes::Bytes| {
+            println!("FLV chunk: {} bytes", chunk.len());
+            chunk
+        }).map_err(|e: std::io::Error| {
+            eprintln!("FLV stream error: {}", e);
+            e
+        }));
+        
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "video/x-flv")
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("Cache-Control", "no-cache")
+            .header("Transfer-Encoding", "chunked")
+            .body(body)
+            .unwrap());
+    }
 }
 
 async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<String>), String> {

@@ -1,0 +1,3 @@
+#EXTM3U
+#EXTINF:-1 tvg-name="RTSP测试" group-title="测试",RTSP测试流
+rtsp://192.168.88.1:8554/stream
