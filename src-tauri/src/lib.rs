@@ -10,6 +10,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode, Method};
 use hyper::header::{CONTENT_TYPE, ACCESS_CONTROL_ALLOW_ORIGIN};
 use std::convert::Infallible;
+use futures_util::TryStreamExt;
 
 struct M3u8Session {
     redirect_chain: Vec<String>,
