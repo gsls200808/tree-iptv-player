@@ -14,13 +14,18 @@
 
       <div class="form-group">
         <label for="sub-url">流地址 *</label>
-        <input
-            id="sub-url"
-            v-model="form.url"
-            type="text"
-            placeholder="http://example.com/playlist.m3u8 或 http://example.com/stream.m3u8"
-            required
-        />
+        <div class="url-input-group">
+          <input
+              id="sub-url"
+              v-model="form.url"
+              type="text"
+              placeholder="http://example.com/playlist.m3u8 或选择本地文件"
+              required
+          />
+          <button type="button" class="file-select-btn" @click="handleSelectFile" :disabled="loading">
+            📁 选择文件
+          </button>
+        </div>
       </div>
 
       <div v-if="previewType" class="type-preview">
@@ -45,7 +50,8 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { detectStreamType, fetchPlaylist } from '../utils/subscription';
+import { detectStreamType, fetchPlaylist, parseM3U } from '../utils/subscription';
+import { selectPlaylistFile, readLocalFile } from '../utils/tauriApi';
 import type { ChannelItem } from '../types';
 
 const emit = defineEmits<{
@@ -66,6 +72,65 @@ const previewType = computed(() => {
   return detectedType.value;
 });
 
+const handleSelectFile = async () => {
+  try {
+    const filePath = await selectPlaylistFile();
+    if (filePath) {
+      form.value.url = filePath;
+      
+      // 读取本地文件内容并检测类型
+      loading.value = true;
+      error.value = '';
+      
+      try {
+        const content = await readLocalFile(filePath);
+        
+        // 根据文件扩展名和内容判断类型
+        let type: 'single' | 'playlist' = 'single';
+        const trimmedContent = content.trim();
+        
+        // M3U/M3U8 文件通常是播放列表
+        if (filePath.endsWith('.m3u') || filePath.endsWith('.m3u8')) {
+          if (trimmedContent.startsWith('#EXTM3U')) {
+            type = 'playlist';
+          }
+        } else if (filePath.endsWith('.mpd')) {
+          // MPD 文件可能是单个流或包含在 M3U 中
+          // 如果内容是 XML 格式的 MPD，则是单流
+          if (trimmedContent.startsWith('<?xml') || trimmedContent.includes('<MPD')) {
+            type = 'single';
+          } else {
+            // 可能是一个 M3U 文件包含了 MPD 链接
+            type = trimmedContent.startsWith('#EXTM3U') ? 'playlist' : 'single';
+          }
+        }
+        
+        detectedType.value = type;
+        
+        // 如果是播放列表，解析它
+        if (type === 'playlist') {
+          try {
+            if (filePath.endsWith('.m3u') || filePath.endsWith('.m3u8')) {
+              const channels = parseM3U(content);
+              console.log(`Parsed ${channels.length} channels from local file`);
+            }
+          } catch (e) {
+            console.error('Failed to parse local playlist:', e);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to process local file:', e);
+        error.value = '读取文件失败';
+      } finally {
+        loading.value = false;
+      }
+    }
+  } catch (e) {
+    console.error('File selection failed:', e);
+    error.value = '选择文件失败';
+  }
+};
+
 const handleSubmit = async () => {
   if (!form.value.url) return;
 
@@ -74,13 +139,28 @@ const handleSubmit = async () => {
 
   try {
     const url = form.value.url.trim();
-    const type = await detectStreamType(url);
-    detectedType.value = type;
+    
+    // 使用已检测的类型，如果没有则重新检测
+    let type = detectedType.value;
+    if (!type) {
+      type = await detectStreamType(url);
+      detectedType.value = type;
+    }
 
     let channels: ChannelItem[] = [];
     if (type === 'playlist') {
       try {
-        channels = await fetchPlaylist(url);
+        // 如果是本地文件，需要特殊处理
+        if (url.startsWith('file://') || !url.startsWith('http')) {
+          // 本地文件，读取并解析
+          const content = await readLocalFile(url);
+          if (url.endsWith('.m3u') || url.endsWith('.m3u8')) {
+            channels = parseM3U(content);
+          }
+        } else {
+          // 网络 URL
+          channels = await fetchPlaylist(url);
+        }
       } catch (e) {
         console.error('Failed to fetch playlist, treating as single stream:', e);
         channels = [];
@@ -136,6 +216,35 @@ const handleSubmit = async () => {
   border-radius: 6px;
   font-size: 14px;
   box-sizing: border-box;
+}
+
+.url-input-group {
+  display: flex;
+  gap: 8px;
+}
+
+.url-input-group input {
+  flex: 1;
+}
+
+.file-select-btn {
+  padding: 10px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.file-select-btn:hover:not(:disabled) {
+  background: var(--border-color);
+}
+
+.file-select-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .type-preview {

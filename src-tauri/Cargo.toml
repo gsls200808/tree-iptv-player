@@ -1,6 +1,6 @@
 [package]
 name = "tree-iptv-player"
-version = "0.1.8"
+version = "0.1.9"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -27,3 +27,5 @@ urlencoding = "2.1"
 bytes = "1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-fs = "2.5.1"

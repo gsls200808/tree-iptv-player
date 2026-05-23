@@ -10,7 +10,6 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode, Method};
 use hyper::header::{CONTENT_TYPE, ACCESS_CONTROL_ALLOW_ORIGIN};
 use std::convert::Infallible;
-use futures_util::TryStreamExt;
 
 struct M3u8Session {
     redirect_chain: Vec<String>,
@@ -293,8 +292,31 @@ async fn handle_proxy_request(
     println!("Proxying request to: {}", full_url);
 
     let is_m3u8 = full_url.contains(".m3u8") || full_url.contains(".m3u");
+    let is_mpd = full_url.contains(".mpd");
 
-    if is_m3u8 {
+    if is_mpd {
+        // MPD (MPEG-DASH): buffer and rewrite URLs similar to m3u8
+        match handle_mpd_request(full_url.clone()).await {
+            Ok(response_body) => {
+                println!("Successfully fetched MPD {} bytes", response_body.len());
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/dash+xml")
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header("Cache-Control", "no-cache")
+                    .body(Body::from(response_body))
+                    .unwrap())
+            }
+            Err(e) => {
+                eprintln!("MPD proxy error: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(format!("MPD proxy error: {}", e)))
+                    .unwrap())
+            }
+        }
+    } else if is_m3u8 {
         // HLS m3u8: buffer and rewrite URLs
         match handle_m3u8_request(full_url.clone()).await {
             Ok((response_body, redirect_chain)) => {
@@ -602,6 +624,135 @@ async fn handle_flv_proxy_request(original_url: String) -> Result<Response<Body>
             .body(body)
             .unwrap());
     }
+}
+
+async fn handle_mpd_request(original_url: String) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let response = client.get(&original_url).send().await
+        .map_err(|e| format!("Failed to fetch MPD: {}", e))?;
+
+    let mpd_text = response.text().await
+        .map_err(|e| format!("Failed to read MPD: {}", e))?;
+
+    // Get base URL from the original URL
+    let base_url = extract_base_url(&original_url);
+    
+    println!("\n========== MPD Processing ==========");
+    println!("  Original URL: {}", original_url);
+    println!("  Base URL: {}", base_url);
+    println!("====================================\n");
+
+    // Rewrite relative URLs in MPD to proxy URLs
+    let modified_mpd = rewrite_mpd_urls(&mpd_text, &base_url, &original_url);
+    
+    // Debug: print first 500 chars of modified MPD
+    println!("\n========== Modified MPD (first 500 chars) ==========");
+    if modified_mpd.len() > 500 {
+        println!("{}", &modified_mpd[..500]);
+    } else {
+        println!("{}", modified_mpd);
+    }
+    println!("===================================================\n");
+    
+    Ok(modified_mpd.into_bytes())
+}
+
+fn rewrite_mpd_urls(mpd_content: &str, base_url: &str, original_mpd_url: &str) -> String {
+    let mut result = String::new();
+    
+    // Parse and rewrite URLs in MPD
+    // Process all lines to find URL patterns
+    let lines: Vec<&str> = mpd_content.lines().collect();
+    
+    for line in lines {
+        let rewritten_line = rewrite_mpd_line(line, base_url, original_mpd_url);
+        result.push_str(&rewritten_line);
+        result.push('\n');
+    }
+    
+    result
+}
+
+fn rewrite_mpd_line(line: &str, base_url: &str, _original_mpd_url: &str) -> String {
+    // Look for URL patterns in MPD attributes
+    let mut result = line.to_string();
+    
+    // Match sourceURL, initialization, media attributes - keep replacing until no more matches
+    let patterns = ["sourceURL=\"", "initialization=\"", "media=\""];
+    
+    // Keep trying to replace URLs until no more replacements are made
+    loop {
+        let mut replaced = false;
+        
+        for pattern in &patterns {
+            if let Some(start_pos) = result.find(pattern) {
+                // Extract all needed data before modifying result
+                let after_pattern_start = start_pos + pattern.len();
+                let after_pattern_str = &result[after_pattern_start..];
+                
+                if let Some(end_quote) = after_pattern_str.find('"') {
+                    let url = &after_pattern_str[..end_quote];
+                    
+                    // Only rewrite relative URLs (not already proxied)
+                    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("/proxy/") {
+                        let full_url = if url.starts_with('/') {
+                            // Absolute path from domain root
+                            if let Some(slash_pos) = base_url.find("//") {
+                                if let Some(third_slash) = base_url[slash_pos + 2..].find('/') {
+                                    let domain_part = &base_url[..slash_pos + 2 + third_slash];
+                                    format!("{}{}", domain_part, url)
+                                } else {
+                                    format!("{}{}", base_url, url)
+                                }
+                            } else {
+                                format!("{}{}", base_url, url)
+                            }
+                        } else {
+                            // Relative path
+                            format!("{}{}", base_url, url)
+                        };
+                        
+                        // Check if URL contains DASH template variables
+                        let has_template_vars = url.contains("$");
+                        
+                        let proxy_url = if has_template_vars {
+                            // For URLs with template variables, we need to preserve them
+                            // Encode only the base part, keep template variables as-is
+                            let url_with_placeholder = full_url.replace("$", "__DASH_TEMPLATE_PLACEHOLDER__");
+                            let encoded_base = urlencoding::encode(&url_with_placeholder);
+                            let mut proxy = format!("/proxy/{}", encoded_base);
+                            // Restore template variables
+                            proxy = proxy.replace("__DASH_TEMPLATE_PLACEHOLDER__", "$");
+                            proxy
+                        } else {
+                            let encoded_url = urlencoding::encode(&full_url);
+                            format!("/proxy/{}", encoded_url)
+                        };
+                        
+                        println!("  Rewrote: {} -> {}", url, proxy_url);
+                        
+                        // Clone the parts we need to construct the new string
+                        let before_url = result[..after_pattern_start].to_string();
+                        let after_url = after_pattern_str[end_quote..].to_string();
+                        result = format!("{}{}{}", before_url, proxy_url, after_url);
+                        replaced = true;
+                        break; // Restart the loop to check for more patterns
+                    }
+                }
+            }
+        }
+        
+        // If no replacements were made in this iteration, we're done
+        if !replaced {
+            break;
+        }
+    }
+    
+    result
 }
 
 async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<String>), String> {
@@ -1169,6 +1320,8 @@ async fn stop_rtsp_proxy(rtsp_url: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             greet,
             fetch_url_content,

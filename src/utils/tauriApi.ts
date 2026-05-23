@@ -1,4 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+import { readTextFile } from '@tauri-apps/plugin-fs';
 
 export async function fetchUrlContent(url: string): Promise<string> {
     try {
@@ -55,5 +57,34 @@ export async function startRtspProxy(rtspUrl: string): Promise<string> {
 export async function stopRtspProxy(rtspUrl: string): Promise<void> {
     await invoke('stop_rtsp_proxy', { rtspUrl });
     console.log('RTSP proxy stopped for:', rtspUrl);
+}
+
+export async function selectPlaylistFile(): Promise<string | null> {
+    try {
+        const selected = await open({
+            multiple: false,
+            filters: [{
+                name: 'Playlist Files',
+                extensions: ['m3u', 'm3u8', 'mpd']
+            }]
+        });
+        
+        if (selected && typeof selected === 'string') {
+            return selected;
+        }
+        return null;
+    } catch (error) {
+        console.error('Failed to select file:', error);
+        throw error;
+    }
+}
+
+export async function readLocalFile(filePath: string): Promise<string> {
+    try {
+        return await readTextFile(filePath);
+    } catch (error) {
+        console.error('Failed to read file:', error);
+        throw error;
+    }
 }
 

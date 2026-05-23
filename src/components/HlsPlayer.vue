@@ -10,6 +10,7 @@
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
+import * as dashjs from 'dashjs';
 import { getProxyUrl, startRtspProxy, stopRtspProxy } from '../utils/tauriApi';
 
 const props = defineProps<{
@@ -21,14 +22,17 @@ const error = ref<string>('');
 const loading = ref(true);
 let hls: Hls | null = null;
 let flvPlayer: any = null;
+let dashPlayer: dashjs.MediaPlayerClass | null = null;
 let currentRtspUrl: string | null = null;
 
 // Determine stream type from URL
-function getStreamType(url: string): 'flv' | 'hls' | 'rtsp' {
+function getStreamType(url: string): 'flv' | 'hls' | 'mpd' | 'rtsp' {
   const lower = url.toLowerCase();
   if (lower.startsWith('rtsp://')) return 'rtsp';
   // Direct .flv URL
   if (lower.includes('.flv')) return 'flv';
+  // MPD (MPEG-DASH) files
+  if (lower.includes('.mpd') || lower.includes('manifest.mpd')) return 'mpd';
   // vodId API paths that are known to serve FLV
   if (lower.includes('vodid=') && (lower.includes('/fhx/') || lower.includes('/fh'))) {
     return 'flv';
@@ -51,6 +55,14 @@ const destroyPlayers = () => {
       console.warn('Error destroying FLV player:', e);
     }
     flvPlayer = null;
+  }
+  if (dashPlayer) {
+    try {
+      dashPlayer.reset();
+      dashPlayer = null;
+    } catch (e) {
+      console.warn('Error destroying DASH player:', e);
+    }
   }
   if (currentRtspUrl) {
     stopRtspProxy(currentRtspUrl).catch((e) => {
@@ -139,6 +151,75 @@ const initFlvPlayer = async (streamUrl: string) => {
       tryPlay();
     }
   }, 5000);
+};
+
+const initDashPlayer = async (streamUrl: string) => {
+  if (!videoElement.value) return;
+
+  const video = videoElement.value;
+
+  try {
+    dashPlayer = dashjs.MediaPlayer().create();
+    
+    // 配置 DASH 播放器 - 只使用支持的配置
+    dashPlayer.updateSettings({
+      streaming: {
+        buffer: {
+          fastSwitchEnabled: true,
+          flushBufferAtTrackSwitch: false
+        }
+      }
+    });
+    
+    // 监听更多事件用于调试
+    dashPlayer.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, (event: any) => {
+      console.log('DASH manifest loaded:', event);
+      console.log('MPD type:', event.data?.type);
+      console.log('Periods:', event.data?.periods);
+      loading.value = false;
+    });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+      console.log('DASH stream initialized');
+    });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.PERIOD_SWITCH_STARTED, () => {
+      console.log('DASH period switch started');
+    });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.ERROR, (event: any) => {
+      console.error('DASH error:', event);
+      error.value = `DASH 播放错误: ${event.message || '未知错误'}`;
+      loading.value = false;
+    });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_STARTED, (event: any) => {
+      console.log('DASH fragment loading:', event.request?.url);
+    });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, (event: any) => {
+      console.log('DASH fragment loaded:', event.response?.url);
+    });
+
+    video.addEventListener('playing', () => {
+      console.log('Video playing');
+      loading.value = false;
+    });
+
+    video.addEventListener('error', (e: any) => {
+      console.error('Video element error:', e);
+      error.value = '视频加载失败';
+      loading.value = false;
+    });
+
+    // 初始化播放器
+    dashPlayer.initialize(video, streamUrl, true);
+    console.log('DASH player initialized with URL:', streamUrl);
+  } catch (e) {
+    console.error('DASH player init error:', e);
+    error.value = 'DASH 播放器初始化失败';
+    loading.value = false;
+  }
 };
 
 const initHlsPlayer = async (streamUrl: string) => {
@@ -242,6 +323,8 @@ const initPlayer = async () => {
 
     if (streamType === 'flv') {
       await initFlvPlayer(playUrl);
+    } else if (streamType === 'mpd') {
+      await initDashPlayer(playUrl);
     } else {
       // Both HLS and RTSP (transcoded to HLS) play through the HLS player
       await initHlsPlayer(playUrl);
