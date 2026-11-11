@@ -349,6 +349,22 @@ async fn handle_proxy_request(
                     .unwrap())
             }
         }
+    } else if is_live_ts_url(&full_url) && !is_registered_hls_segment(&full_url).await {
+        // 直播 MPEG-TS（rtp2httpd / udpxy 等）：必须流式转发，等待完整响应会一直挂起
+        match handle_live_ts_request(full_url.clone()).await {
+            Ok(response) => {
+                println!("Live MPEG-TS proxy started for: {}", full_url);
+                Ok(response)
+            }
+            Err(e) => {
+                eprintln!("Live MPEG-TS proxy error: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(format!("Live stream proxy error: {}", e)))
+                    .unwrap())
+            }
+        }
     } else {
         // For non-m3u8 URLs: follow redirects to detect actual content type
         // (handles vodId URLs that redirect to .flv or .m3u8)
@@ -369,6 +385,7 @@ async fn handle_proxy_request(
 
         let mut check_url = full_url.clone();
         let mut is_final_flv = false;
+        let mut is_live_ts = false;
 
         // Follow redirects to find the final URL
         for _ in 0..10 {
@@ -406,6 +423,7 @@ async fn handle_proxy_request(
                     if ct_str.contains("video/x-flv") {
                         is_final_flv = true;
                     }
+                    is_live_ts = is_mpegts_content_type(ct_str);
                 }
                 break;
             }
@@ -424,6 +442,22 @@ async fn handle_proxy_request(
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                         .body(Body::from(format!("FLV proxy error: {}", e)))
+                        .unwrap())
+                }
+            }
+        } else if is_live_ts && !is_registered_hls_segment(&check_url).await {
+            // 上游按 MPEG-TS 返回且不是 HLS 分片：按直播流透传
+            match handle_live_ts_request(check_url.clone()).await {
+                Ok(response) => {
+                    println!("Live MPEG-TS streaming started for: {}", check_url);
+                    Ok(response)
+                }
+                Err(e) => {
+                    eprintln!("Live MPEG-TS proxy error: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Body::from(format!("Live stream proxy error: {}", e)))
                         .unwrap())
                 }
             }
@@ -836,6 +870,69 @@ async fn handle_m3u8_request(original_url: String) -> Result<(Vec<u8>, Vec<Strin
     }
 
     Ok((response_body, redirect_chain))
+}
+
+/// 判断是否为直播 MPEG-TS 地址（rtp2httpd、udpxy 等组播转 HTTP 的地址）。
+/// 这类响应没有 Content-Length 且不会结束，必须流式转发。
+fn is_live_ts_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or("");
+    path.contains("/rtp/")
+        || path.contains("/udp/")
+        || path.contains("/udpxy/")
+        || path.ends_with(".ts")
+}
+
+fn is_mpegts_content_type(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    ct.contains("mp2t") || ct.contains("mpegts")
+}
+
+/// 该 URL 是否为本应用已解析的 HLS 分片（分片需要走失败切换逻辑，不能直接透传）
+async fn is_registered_hls_segment(url: &str) -> bool {
+    TS_TO_M3U8_MAP.lock().await.contains_key(url)
+}
+
+/// 直播 MPEG-TS 透传：边收边发，不做整体缓冲
+async fn handle_live_ts_request(url: String) -> Result<Response<Body>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let upstream = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Live stream connect failed: {}", e))?;
+
+    if !upstream.status().is_success() {
+        return Err(format!("Upstream returned {}", upstream.status()));
+    }
+
+    let content_type = upstream
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("video/mp2t")
+        .to_string();
+
+    println!("Live MPEG-TS stream started: {} (content-type: {})", url, content_type);
+
+    let stream = upstream
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header("Cache-Control", "no-cache, no-store, must-revalidate")
+        .header("Pragma", "no-cache")
+        .body(Body::wrap_stream(stream))
+        .unwrap())
 }
 
 async fn handle_ts_request(ts_url: String) -> Result<Vec<u8>, String> {

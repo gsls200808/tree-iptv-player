@@ -22,11 +22,23 @@ const error = ref<string>('');
 const loading = ref(true);
 let hls: Hls | null = null;
 let flvPlayer: any = null;
+let tsPlayer: any = null;
 let dashPlayer: dashjs.MediaPlayerClass | null = null;
 let currentRtspUrl: string | null = null;
 
+// 裸 MPEG-TS 直播流（rtp2httpd、udpxy 等组播转 HTTP 的地址）
+function isRawMpegtsUrl(lower: string): boolean {
+  const path = lower.split('?')[0].split('#')[0];
+  return (
+    path.includes('/rtp/') ||
+    path.includes('/udp/') ||
+    path.includes('/udpxy/') ||
+    path.endsWith('.ts')
+  );
+}
+
 // Determine stream type from URL
-function getStreamType(url: string): 'flv' | 'hls' | 'mpd' | 'rtsp' {
+function getStreamType(url: string): 'flv' | 'hls' | 'mpd' | 'rtsp' | 'mpegts' {
   const lower = url.toLowerCase();
   if (lower.startsWith('rtsp://')) return 'rtsp';
   // Direct .flv URL
@@ -37,6 +49,8 @@ function getStreamType(url: string): 'flv' | 'hls' | 'mpd' | 'rtsp' {
   if (lower.includes('vodid=') && (lower.includes('/fhx/') || lower.includes('/fh'))) {
     return 'flv';
   }
+  // Raw MPEG-TS over HTTP
+  if (isRawMpegtsUrl(lower)) return 'mpegts';
   return 'hls';
 }
 
@@ -55,6 +69,17 @@ const destroyPlayers = () => {
       console.warn('Error destroying FLV player:', e);
     }
     flvPlayer = null;
+  }
+  if (tsPlayer) {
+    try {
+      tsPlayer.pause();
+      tsPlayer.unload();
+      tsPlayer.detachMediaElement();
+      tsPlayer.destroy();
+    } catch (e) {
+      console.warn('Error destroying MPEG-TS player:', e);
+    }
+    tsPlayer = null;
   }
   if (dashPlayer) {
     try {
@@ -151,6 +176,82 @@ const initFlvPlayer = async (streamUrl: string) => {
       tryPlay();
     }
   }, 5000);
+};
+
+const initMpegtsPlayer = async (streamUrl: string) => {
+  if (!videoElement.value) return;
+
+  const video = videoElement.value;
+
+  if (!mpegts.isSupported()) {
+    error.value = '您的浏览器不支持 MPEG-TS 播放';
+    loading.value = false;
+    return;
+  }
+
+  tsPlayer = mpegts.createPlayer(
+    {
+      type: 'mpegts',
+      isLive: true,
+      url: streamUrl,
+    },
+    {
+      enableStashBuffer: false,
+      lazyLoad: false,
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxLatency: 1.5,
+      liveBufferLatencyMinRemain: 0.3,
+      autoCleanupSourceBuffer: true,
+    }
+  );
+
+  let started = false;
+
+  const tryPlay = () => {
+    if (started) return;
+    started = true;
+    loading.value = false;
+    // Muted autoplay is always allowed by browsers
+    video.muted = true;
+    video
+      .play()
+      .then(() => {
+        console.log('MPEG-TS autoplay started (muted)');
+        setTimeout(() => {
+          video.muted = false;
+        }, 100);
+      })
+      .catch((e) => {
+        console.log('Auto-play failed:', e);
+      });
+  };
+
+  tsPlayer.attachMediaElement(video);
+  tsPlayer.load();
+
+  tsPlayer.on(mpegts.Events.MEDIA_INFO, () => {
+    console.log('MPEG-TS media info received');
+    tryPlay();
+  });
+
+  tsPlayer.on(mpegts.Events.METADATA_ARRIVED, () => {
+    console.log('MPEG-TS metadata loaded');
+    tryPlay();
+  });
+
+  tsPlayer.on(mpegts.Events.ERROR, (errorType: string, errorDetail: string, errorInfo: any) => {
+    console.error('MPEG-TS error:', errorType, errorDetail, errorInfo);
+    error.value = `MPEG-TS 播放错误: ${errorDetail}`;
+    loading.value = false;
+  });
+
+  // 兜底：长时间收不到可播放数据时给出明确提示，避免一直转圈
+  setTimeout(() => {
+    if (!started) {
+      error.value = '无法解码该流，请确认地址是 MPEG-TS 直播流';
+      loading.value = false;
+    }
+  }, 10000);
 };
 
 const initDashPlayer = async (streamUrl: string) => {
@@ -323,6 +424,8 @@ const initPlayer = async () => {
 
     if (streamType === 'flv') {
       await initFlvPlayer(playUrl);
+    } else if (streamType === 'mpegts') {
+      await initMpegtsPlayer(playUrl);
     } else if (streamType === 'mpd') {
       await initDashPlayer(playUrl);
     } else {
