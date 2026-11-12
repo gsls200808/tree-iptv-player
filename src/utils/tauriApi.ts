@@ -59,6 +59,23 @@ export async function stopRtspProxy(rtspUrl: string): Promise<void> {
     console.log('RTSP proxy stopped for:', rtspUrl);
 }
 
+// 检测视频流是否为隔行扫描
+export async function detectInterlaced(url: string): Promise<boolean> {
+    return await invoke<boolean>('detect_interlaced', { url });
+}
+
+// 通过 FFmpeg 转码为本地 HLS：deinterlace 开启反交错，音频统一转 AAC 双声道
+export async function startFfmpegProxy(url: string, deinterlace: boolean): Promise<string> {
+    const port = await invoke<number>('start_ffmpeg_proxy', { url, deinterlace });
+    console.log('FFmpeg proxy started on port:', port, 'deinterlace:', deinterlace);
+    return `http://127.0.0.1:${port}/playlist.m3u8`;
+}
+
+export async function stopFfmpegProxy(url: string): Promise<void> {
+    await invoke('stop_ffmpeg_proxy', { url });
+    console.log('FFmpeg proxy stopped for:', url);
+}
+
 export async function selectPlaylistFile(): Promise<string | null> {
     try {
         const selected = await open({

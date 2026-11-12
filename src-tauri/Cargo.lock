@@ -4642,7 +4642,7 @@ dependencies = [
 
 [[package]]
 name = "tree-iptv-player"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "bytes",
  "futures-util",

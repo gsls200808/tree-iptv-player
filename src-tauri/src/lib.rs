@@ -30,6 +30,8 @@ lazy_static::lazy_static! {
     static ref ACTIVE_HOST_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref RTSP_PROCESSES: Mutex<HashMap<String, tokio::process::Child>> = Mutex::new(HashMap::new());
     static ref RTSP_PORTS: Mutex<HashMap<String, u16>> = Mutex::new(HashMap::new());
+    static ref FFMPEG_PROCESSES: Mutex<HashMap<String, tokio::process::Child>> = Mutex::new(HashMap::new());
+    static ref FFMPEG_PORTS: Mutex<HashMap<String, u16>> = Mutex::new(HashMap::new());
 }
 
 #[command]
@@ -1414,6 +1416,234 @@ async fn stop_rtsp_proxy(rtsp_url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// FFmpeg 转码代理的临时 HLS 目录
+fn ffmpeg_hls_dir(url: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ffmpeg_hls_{}",
+        url.replace(&['/', ':', '.', '?', '&', '=', '\\'][..], "_")
+    ))
+}
+
+fn spawn_hls_files_server(dir: PathBuf) -> u16 {
+    let server_dir = Arc::new(dir);
+    let make_svc = make_service_fn(move |_conn| {
+        let dir = server_dir.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                serve_hls_file(req, dir.clone())
+            }))
+        }
+    });
+
+    let addr = ([127, 0, 0, 1], 0).into();
+    let server = Server::bind(&addr).serve(make_svc);
+    let port = server.local_addr().port();
+
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            eprintln!("HLS file server error: {}", e);
+        }
+    });
+
+    port
+}
+
+/// 判断视频流是否为隔行扫描：
+/// 先看流的 field_order 元数据；无法判断时再解码少量帧检查 interlaced_frame 标记。
+#[command]
+async fn detect_interlaced(url: String) -> Result<bool, String> {
+    let mut cmd = tokio::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=field_order",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(&url)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .map_err(|_| "ffprobe timeout".to_string())?
+        .map_err(|e| format!("Failed to run ffprobe: {}. Is ffmpeg installed?", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    let mut has_progressive = false;
+    for line in stdout.lines().map(|l| l.trim()) {
+        match line {
+            "tt" | "bb" | "tb" | "bt" | "interlaced" => return Ok(true),
+            "progressive" => has_progressive = true,
+            _ => {}
+        }
+    }
+    if has_progressive {
+        return Ok(false);
+    }
+
+    // 元数据缺失，解码少量帧判断
+    let mut cmd = tokio::process::Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        "%+#40",
+        "-show_entries",
+        "frame=interlaced_frame",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(&url)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
+        .await
+        .map_err(|_| "ffprobe frame scan timeout".to_string())?
+        .map_err(|e| format!("Failed to run ffprobe: {}. Is ffmpeg installed?", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|l| l.trim() == "1"))
+}
+
+/// 用 FFmpeg 把直播流转为本地 HLS：
+/// deinterlace=true 时用 yadif 反交错并重新编码视频；
+/// 音频统一转成 AAC 双声道，兼容 MSE 不支持的音轨（E-AC3、单声道等）。
+#[command]
+async fn start_ffmpeg_proxy(url: String, deinterlace: bool) -> Result<u16, String> {
+    let key = format!("{}|{}", url, if deinterlace { "deint" } else { "remux" });
+
+    {
+        let ports = FFMPEG_PORTS.lock().await;
+        if let Some(&port) = ports.get(&key) {
+            return Ok(port);
+        }
+    }
+
+    stop_ffmpeg_proxy_internal(&url).await;
+
+    let hls_dir = ffmpeg_hls_dir(&url);
+    tokio::fs::create_dir_all(&hls_dir)
+        .await
+        .map_err(|e| format!("Failed to create HLS dir: {}", e))?;
+
+    let playlist_path = hls_dir.join("playlist.m3u8");
+    let segment_pattern = hls_dir.join("stream%05d.ts");
+
+    println!(
+        "FFmpeg proxy: url={}, deinterlace={}, dir={}",
+        url,
+        deinterlace,
+        hls_dir.display()
+    );
+
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-probesize",
+        "500000",
+        "-analyzeduration",
+        "500000",
+        "-i",
+    ])
+    .arg(&url)
+    .args(["-map", "0:v:0?", "-map", "0:a:0?"]);
+
+    if deinterlace {
+        cmd.args([
+            "-vf",
+            "yadif=deint=interlaced",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "23",
+            "-g",
+            "50",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+    } else {
+        cmd.args(["-c:v", "copy"]);
+    }
+
+    cmd.args(["-c:a", "aac", "-ar", "48000", "-ac", "2"])
+        .args([
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_list_size",
+            "6",
+            "-hls_flags",
+            "delete_segments",
+            "-hls_segment_type",
+            "mpegts",
+            "-hls_segment_filename",
+        ])
+        .arg(&segment_pattern)
+        .arg(&playlist_path);
+
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}. Is ffmpeg installed?", e))?;
+
+    let port = spawn_hls_files_server(hls_dir);
+
+    {
+        let mut processes = FFMPEG_PROCESSES.lock().await;
+        processes.insert(url.clone(), child);
+    }
+    {
+        let mut ports = FFMPEG_PORTS.lock().await;
+        ports.insert(key, port);
+    }
+
+    println!("FFmpeg proxy ready: {} -> http://127.0.0.1:{}/", url, port);
+    Ok(port)
+}
+
+async fn stop_ffmpeg_proxy_internal(url: &str) {
+    let mut processes = FFMPEG_PROCESSES.lock().await;
+    if let Some(mut child) = processes.remove(url) {
+        let _ = child.start_kill();
+        println!("Killed FFmpeg proxy for: {}", url);
+    }
+    drop(processes);
+
+    let prefix = format!("{}|", url);
+    let mut ports = FFMPEG_PORTS.lock().await;
+    ports.retain(|k, _| !k.starts_with(&prefix));
+    drop(ports);
+
+    let _ = tokio::fs::remove_dir_all(ffmpeg_hls_dir(url)).await;
+}
+
+#[command]
+async fn stop_ffmpeg_proxy(url: String) -> Result<(), String> {
+    stop_ffmpeg_proxy_internal(&url).await;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1428,7 +1658,10 @@ pub fn run() {
             cache_and_get_local_url,
             start_hls_proxy_server,
             start_rtsp_proxy,
-            stop_rtsp_proxy
+            stop_rtsp_proxy,
+            detect_interlaced,
+            start_ffmpeg_proxy,
+            stop_ffmpeg_proxy
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

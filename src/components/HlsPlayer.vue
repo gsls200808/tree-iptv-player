@@ -11,11 +11,16 @@ import { ref, onMounted, onBeforeUnmount, watch } from 'vue';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 import * as dashjs from 'dashjs';
-import { getProxyUrl, startRtspProxy, stopRtspProxy } from '../utils/tauriApi';
+import { getProxyUrl, startRtspProxy, stopRtspProxy, detectInterlaced, startFfmpegProxy, stopFfmpegProxy } from '../utils/tauriApi';
 
-const props = defineProps<{
-  src: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    src: string;
+    // 全局配置：自动对隔行扫描流开启反交错（仅隔行流生效）
+    autoDeinterlace?: boolean;
+  }>(),
+  { autoDeinterlace: true }
+);
 
 const videoElement = ref<HTMLVideoElement | null>(null);
 const error = ref<string>('');
@@ -25,6 +30,11 @@ let flvPlayer: any = null;
 let tsPlayer: any = null;
 let dashPlayer: dashjs.MediaPlayerClass | null = null;
 let currentRtspUrl: string | null = null;
+let currentFfmpegUrl: string | null = null;
+let mseFallbackStarted = false;
+
+// 同一地址的隔行检测结果做缓存，避免重复探测
+const interlaceCache = new Map<string, boolean>();
 
 // 裸 MPEG-TS 直播流（rtp2httpd、udpxy 等组播转 HTTP 的地址）
 function isRawMpegtsUrl(lower: string): boolean {
@@ -94,6 +104,18 @@ const destroyPlayers = () => {
       console.warn('Error stopping RTSP proxy:', e);
     });
     currentRtspUrl = null;
+  }
+};
+
+// FFmpeg 代理需要等待停止完成，避免与新的启动请求竞争
+const releaseFfmpegProxy = async () => {
+  const url = currentFfmpegUrl;
+  if (!url) return;
+  currentFfmpegUrl = null;
+  try {
+    await stopFfmpegProxy(url);
+  } catch (e) {
+    console.warn('Error stopping FFmpeg proxy:', e);
   }
 };
 
@@ -178,7 +200,7 @@ const initFlvPlayer = async (streamUrl: string) => {
   }, 5000);
 };
 
-const initMpegtsPlayer = async (streamUrl: string) => {
+const initMpegtsPlayer = async (streamUrl: string, onMseFailure?: () => void) => {
   if (!videoElement.value) return;
 
   const video = videoElement.value;
@@ -241,13 +263,22 @@ const initMpegtsPlayer = async (streamUrl: string) => {
 
   tsPlayer.on(mpegts.Events.ERROR, (errorType: string, errorDetail: string, errorInfo: any) => {
     console.error('MPEG-TS error:', errorType, errorDetail, errorInfo);
+    if (errorDetail === 'MediaMSEError' && onMseFailure) {
+      // 音轨（E-AC3、单声道等）或编码不被 MSE 支持，交由上层用 FFmpeg 转码
+      console.warn('MPEG-TS MSE 不支持该编码，切换到 FFmpeg 转码');
+      started = true;
+      loading.value = false;
+      onMseFailure();
+      return;
+    }
+    if (mseFallbackStarted) return;
     error.value = `MPEG-TS 播放错误: ${errorDetail}`;
     loading.value = false;
   });
 
   // 兜底：长时间收不到可播放数据时给出明确提示，避免一直转圈
   setTimeout(() => {
-    if (!started) {
+    if (!started && !mseFallbackStarted) {
       error.value = '无法解码该流，请确认地址是 MPEG-TS 直播流';
       loading.value = false;
     }
@@ -385,10 +416,48 @@ const initHlsPlayer = async (streamUrl: string) => {
   }
 };
 
+// 判断是否需要反交错：仅隔行扫描流返回 true（结果按地址缓存）
+const shouldDeinterlace = async (originalUrl: string): Promise<boolean> => {
+  if (!props.autoDeinterlace) return false;
+
+  const cached = interlaceCache.get(originalUrl);
+  if (cached !== undefined) return cached;
+
+  try {
+    const interlaced = await detectInterlaced(originalUrl);
+    console.log('Interlaced detection:', originalUrl, interlaced);
+    interlaceCache.set(originalUrl, interlaced);
+    return interlaced;
+  } catch (e) {
+    console.warn('Interlaced detection failed:', e);
+    return false;
+  }
+};
+
+// 用 FFmpeg 转码为本地 HLS 后播放：反交错，或修复 MSE 不支持的音轨
+const playWithFfmpegProxy = async (originalUrl: string, deinterlace: boolean) => {
+  try {
+    loading.value = true;
+    error.value = '';
+    await releaseFfmpegProxy();
+    const hlsUrl = await startFfmpegProxy(originalUrl, deinterlace);
+    currentFfmpegUrl = originalUrl;
+    await initHlsPlayer(hlsUrl);
+  } catch (e) {
+    console.error('FFmpeg proxy failed:', e);
+    error.value = deinterlace
+      ? '反交错转码启动失败，请确认已安装 FFmpeg'
+      : '音轨编码不兼容，FFmpeg 转码失败，请确认已安装 FFmpeg';
+    loading.value = false;
+  }
+};
+
 const initPlayer = async () => {
   if (!videoElement.value) return;
 
   destroyPlayers();
+  await releaseFfmpegProxy();
+  mseFallbackStarted = false;
   error.value = '';
   loading.value = true;
 
@@ -425,7 +494,19 @@ const initPlayer = async () => {
     if (streamType === 'flv') {
       await initFlvPlayer(playUrl);
     } else if (streamType === 'mpegts') {
-      await initMpegtsPlayer(playUrl);
+      // 隔行扫描流自动反交错；逐行流保持原始播放，避免无谓的重编码
+      if (await shouldDeinterlace(originalUrl)) {
+        console.log('检测到隔行扫描，启用反交错');
+        await playWithFfmpegProxy(originalUrl, true);
+      } else {
+        await initMpegtsPlayer(playUrl, () => {
+          // MSE 不支持该音轨（E-AC3、单声道等），用 FFmpeg 转 AAC 后播放
+          if (mseFallbackStarted) return;
+          mseFallbackStarted = true;
+          destroyPlayers();
+          void playWithFfmpegProxy(originalUrl, false);
+        });
+      }
     } else if (streamType === 'mpd') {
       await initDashPlayer(playUrl);
     } else {
@@ -450,8 +531,16 @@ watch(
   }
 );
 
+watch(
+  () => props.autoDeinterlace,
+  () => {
+    initPlayer();
+  }
+);
+
 onBeforeUnmount(() => {
   destroyPlayers();
+  void releaseFfmpegProxy();
 });
 </script>
 

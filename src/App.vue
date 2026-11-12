@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import HlsPlayer from './components/HlsPlayer.vue';
 import SubscriptionForm from './components/SubscriptionForm.vue';
 import EPGSubscriptionForm from './components/EPGSubscriptionForm.vue';
@@ -25,6 +25,13 @@ const showAddEPGForm = ref(false);
 const currentStreamUrl = ref<string>('');
 const activeChannelIndex = ref(0);
 const activeTab = ref<'stream' | 'epg'>('stream');
+const showSettings = ref(false);
+// 全局播放设置：默认开启自动反交错（仅隔行扫描流生效）
+const autoDeinterlace = ref(localStorage.getItem('player.autoDeinterlace') !== 'false');
+
+watch(autoDeinterlace, (value) => {
+  localStorage.setItem('player.autoDeinterlace', String(value));
+});
 
 const activeSubscription = computed(() => {
   if (!activeSubscriptionId.value) return null;
@@ -214,6 +221,17 @@ const handleRefreshEPG = async (epgSub: any) => {
   <main class="app-container">
     <header class="app-header">
       <h1>📺 IPTV 播放器</h1>
+      <div class="header-actions">
+        <button class="btn-settings" @click="showSettings = !showSettings">⚙ 设置</button>
+        <div v-if="showSettings" class="settings-panel">
+          <h3>全局播放设置</h3>
+          <label class="settings-option">
+            <input type="checkbox" v-model="autoDeinterlace" />
+            <span>自动反交错</span>
+          </label>
+          <p class="settings-hint">仅对检测为隔行扫描的视频流生效，逐行扫描流不受影响。</p>
+        </div>
+      </div>
     </header>
 
     <div class="app-content">
@@ -294,7 +312,7 @@ const handleRefreshEPG = async (epgSub: any) => {
 
       <section class="main-content">
         <div v-if="currentStreamUrl" class="player-section">
-          <HlsPlayer :src="currentStreamUrl" />
+          <HlsPlayer :src="currentStreamUrl" :auto-deinterlace="autoDeinterlace" />
 
           <div v-if="activeSubscription" class="player-info">
             <h2>{{ activeSubscription.name }}</h2>
@@ -368,11 +386,67 @@ body {
   background: var(--card-bg);
   padding: 20px;
   border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .app-header h1 {
   font-size: 24px;
   margin: 0;
+}
+
+.header-actions {
+  position: relative;
+}
+
+.btn-settings {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn-settings:hover {
+  border-color: var(--accent);
+}
+
+.settings-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 100;
+  width: 280px;
+  padding: 16px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.settings-panel h3 {
+  font-size: 14px;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.settings-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.settings-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
 }
 
 .app-content {
