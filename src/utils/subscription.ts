@@ -4,6 +4,18 @@ import { fetchUrlContent } from './tauriApi';
 const STORAGE_KEY = 'stream_subscriptions';
 const EPG_STORAGE_KEY = 'epg_subscriptions';
 
+function parsePositiveInt(value?: string): number | undefined {
+    if (!value) return undefined;
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+function parseSignedInt(value?: string): number | undefined {
+    if (!value) return undefined;
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.floor(n) : undefined;
+}
+
 export function parseM3U(content: string): ChannelItem[] {
     const lines = content.split('\n').map(line => line.trim());
     const channels: ChannelItem[] = [];
@@ -15,13 +27,20 @@ export function parseM3U(content: string): ChannelItem[] {
 
         if (line.startsWith('#EXTINF:')) {
             const nameMatch = line.match(/,(.+)$/);
-            const logoMatch = line.match(/tvg-logo="([^"]*)"/);
-            const groupMatch = line.match(/group-title="([^"]*)"/);
+            const attr = (key: string) => {
+                const m = line.match(new RegExp(`${key}="([^"]*)"`, 'i'));
+                return m ? m[1] : undefined;
+            };
 
             currentChannel = {
                 name: nameMatch ? nameMatch[1].trim() : `Channel ${channels.length + 1}`,
-                logo: logoMatch ? logoMatch[1] : undefined,
-                group: groupMatch ? groupMatch[1] : undefined,
+                logo: attr('tvg-logo'),
+                group: attr('group-title'),
+                tvgId: attr('tvg-id'),
+                catchup: attr('catchup'),
+                catchupSource: attr('catchup-source'),
+                catchupDays: parsePositiveInt(attr('catchup-days')),
+                catchupCorrection: parseSignedInt(attr('catchup-correction')),
             };
         } else if (line && !line.startsWith('#') && currentChannel.name) {
             currentChannel.url = line;

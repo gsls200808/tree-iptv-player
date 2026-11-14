@@ -32,10 +32,10 @@
 - DIYP 格式（JSON）
 - 节目表显示、当前节目高亮
 - PLTV 回放：对 URL 含 `PLTV` / `TVOD` 的频道，可通过 `?playseek=` 回看已结束的节目
+- 回看兼容 kodi / tivimate 的 m3u catchup 属性：`catchup`（default / append / shift / flussonic）、`catchup-source`（支持 `{start}`、`{end}`、`{utc}`、`{utcend}`、`{lutc}`、`{duration}`、`{channel}` 占位符）、`catchup-days`、`catchup-correction`
 
 ### 待排期
 
-- m3u播放列表 kodi回看格式 tivimate回看格式兼容
 - MCE遥控器控制兼容
 - xbox手柄控制兼容
 - 原生 rtp:// 组播地址（浏览器无法直连组播，需经由 rtp2httpd / udpxy 转 HTTP）

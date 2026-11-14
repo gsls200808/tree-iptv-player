@@ -168,6 +168,7 @@
 <script setup lang="ts">import { ref, computed, watch } from 'vue';
 import type { ChannelItem, EPGSubscription } from '../types';
 import { matchChannelWithEPG, findProgramsByChannel } from '../utils/epgParser';
+import { supportsCatchup, catchupDays, buildCatchupUrl } from '../utils/catchup';
 
 const props = defineProps<{
   channels: ChannelItem[];
@@ -195,11 +196,7 @@ const hasEPGSupport = computed(() => {
 const hasPlaybackSupport = computed(() => {
   if (!hasEPGSupport.value || props.activeIndex === undefined) return false;
 
-  const currentChannel = props.channels[props.activeIndex];
-  if (!currentChannel) return false;
-
-  const url = currentChannel.url.toUpperCase();
-  return url.includes('PLTV') || url.includes('TVOD');
+  return supportsCatchup(props.channels[props.activeIndex]);
 });
 
 const currentChannelName = computed(() => {
@@ -267,6 +264,9 @@ const isCurrentProgram = (program: any) => {
 
 const canPlayback = (program: any) => {
   if (selectedDateOffset.value > 0) return false;
+
+  const channel = props.activeIndex !== undefined ? props.channels[props.activeIndex] : undefined;
+  if (selectedDateOffset.value < -catchupDays(channel)) return false;
 
   if (selectedDateOffset.value < 0) {
     return true;
@@ -429,20 +429,12 @@ const handleProgramPlayback = (program: any) => {
   const currentChannel = props.channels[props.activeIndex];
 
   try {
-    const baseUrl = currentChannel.url.split('?')[0];
+    const playbackUrl = buildCatchupUrl(currentChannel, program, selectedDate.value);
 
-    const targetDate = selectedDate.value;
-    const year = targetDate.getFullYear();
-    const month = String(targetDate.getMonth() + 1).padStart(2, '0');
-    const day = String(targetDate.getDate()).padStart(2, '0');
-
-    const startParts = program.start.split(':');
-    const endParts = program.end.split(':');
-
-    const startTime = `${year}${month}${day}${startParts[0]}${startParts[1]}00`;
-    const endTime = `${year}${month}${day}${endParts[0]}${endParts[1]}00`;
-
-    const playbackUrl = `${baseUrl}?playseek=${startTime}-${endTime}`;
+    if (!playbackUrl) {
+      error.value = '该频道不支持回看';
+      return;
+    }
 
     console.log('Playback URL:', playbackUrl);
     emit('playback', playbackUrl);

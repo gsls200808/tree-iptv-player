@@ -13,6 +13,12 @@ export interface ChannelItem {
     logo?: string;
     group?: string;
     epgName?: string;
+    tvgId?: string;
+    // 回看配置（kodi / tivimate m3u 约定）
+    catchup?: string;
+    catchupSource?: string;
+    catchupDays?: number;
+    catchupCorrection?: number;
 }
 
 export interface EPGProgram {
