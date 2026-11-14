@@ -1328,7 +1328,7 @@ async fn start_rtsp_proxy(rtsp_url: String) -> Result<u16, String> {
     println!("RTSP proxy: dir={}", hls_dir.display());
 
     // Start FFmpeg: RTSP -> HLS (TS segments)
-    let child = tokio::process::Command::new("ffmpeg")
+    let child = hidden_command("ffmpeg")
         .arg("-rtsp_transport")
         .arg("tcp")
         .arg("-i")
@@ -1424,6 +1424,32 @@ fn ffmpeg_hls_dir(url: &str) -> PathBuf {
     ))
 }
 
+/// 创建子进程命令：Windows 下隐藏控制台窗口，避免 GUI 应用弹出 cmd 黑窗
+fn hidden_command(program: &str) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// 子进程 stderr 重定向到日志文件，避免继承不存在的控制台
+fn ffmpeg_log_stdio() -> std::process::Stdio {
+    let path = std::env::temp_dir().join("tree-iptv-ffmpeg.log");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => std::process::Stdio::from(file),
+        Err(_) => std::process::Stdio::null(),
+    }
+}
+
 fn spawn_hls_files_server(dir: PathBuf) -> u16 {
     let server_dir = Arc::new(dir);
     let make_svc = make_service_fn(move |_conn| {
@@ -1452,10 +1478,14 @@ fn spawn_hls_files_server(dir: PathBuf) -> u16 {
 /// 先看流的 field_order 元数据；无法判断时再解码少量帧检查 interlaced_frame 标记。
 #[command]
 async fn detect_interlaced(url: String) -> Result<bool, String> {
-    let mut cmd = tokio::process::Command::new("ffprobe");
+    let mut cmd = hidden_command("ffprobe");
     cmd.args([
         "-v",
         "error",
+        "-probesize",
+        "2000000",
+        "-analyzeduration",
+        "2000000",
         "-select_streams",
         "v:0",
         "-show_entries",
@@ -1468,7 +1498,7 @@ async fn detect_interlaced(url: String) -> Result<bool, String> {
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+    let output = tokio::time::timeout(std::time::Duration::from_secs(4), cmd.output())
         .await
         .map_err(|_| "ffprobe timeout".to_string())?
         .map_err(|e| format!("Failed to run ffprobe: {}. Is ffmpeg installed?", e))?;
@@ -1487,10 +1517,14 @@ async fn detect_interlaced(url: String) -> Result<bool, String> {
     }
 
     // 元数据缺失，解码少量帧判断
-    let mut cmd = tokio::process::Command::new("ffprobe");
+    let mut cmd = hidden_command("ffprobe");
     cmd.args([
         "-v",
         "error",
+        "-probesize",
+        "2000000",
+        "-analyzeduration",
+        "2000000",
         "-select_streams",
         "v:0",
         "-read_intervals",
@@ -1505,13 +1539,58 @@ async fn detect_interlaced(url: String) -> Result<bool, String> {
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
+    let output = tokio::time::timeout(std::time::Duration::from_secs(6), cmd.output())
         .await
         .map_err(|_| "ffprobe frame scan timeout".to_string())?
         .map_err(|e| format!("Failed to run ffprobe: {}. Is ffmpeg installed?", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout.lines().any(|l| l.trim() == "1"))
+}
+
+/// 等待 FFmpeg 写出首个播放列表；进程提前退出则立即失败
+async fn wait_for_playlist(
+    path: &std::path::Path,
+    child: &mut tokio::process::Child,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let ready = tokio::fs::metadata(path)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if ready {
+            return Ok(());
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(format!("FFmpeg 提前退出（{}）", status)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("无法获取 FFmpeg 状态: {}", e)),
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err("FFmpeg 未能在 8 秒内生成播放列表".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// 读取 FFmpeg 日志末尾几行，用于把真实失败原因带回前端
+async fn read_ffmpeg_log_tail() -> String {
+    let path = std::env::temp_dir().join("tree-iptv-ffmpeg.log");
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let lines: Vec<&str> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let start = lines.len().saturating_sub(3);
+            let tail = lines[start..].join(" | ");
+            tail.chars().take(400).collect()
+        }
+        Err(_) => String::new(),
+    }
 }
 
 /// 用 FFmpeg 把直播流转为本地 HLS：
@@ -1521,11 +1600,23 @@ async fn detect_interlaced(url: String) -> Result<bool, String> {
 async fn start_ffmpeg_proxy(url: String, deinterlace: bool) -> Result<u16, String> {
     let key = format!("{}|{}", url, if deinterlace { "deint" } else { "remux" });
 
-    {
+    // 复用缓存前先确认 ffmpeg 仍存活，避免把已经死掉的端口返回给前端
+    let cached_port = {
         let ports = FFMPEG_PORTS.lock().await;
-        if let Some(&port) = ports.get(&key) {
+        ports.get(&key).copied()
+    };
+    if let Some(port) = cached_port {
+        let alive = {
+            let mut processes = FFMPEG_PROCESSES.lock().await;
+            match processes.get_mut(&url) {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            }
+        };
+        if alive {
             return Ok(port);
         }
+        println!("FFmpeg proxy 已退出，重新启动: {}", url);
     }
 
     stop_ffmpeg_proxy_internal(&url).await;
@@ -1545,16 +1636,16 @@ async fn start_ffmpeg_proxy(url: String, deinterlace: bool) -> Result<u16, Strin
         hls_dir.display()
     );
 
-    let mut cmd = tokio::process::Command::new("ffmpeg");
+    let mut cmd = hidden_command("ffmpeg");
     cmd.args([
         "-hide_banner",
         "-loglevel",
         "warning",
         "-nostdin",
         "-probesize",
-        "500000",
+        "2000000",
         "-analyzeduration",
-        "500000",
+        "2000000",
         "-i",
     ])
     .arg(&url)
@@ -1600,12 +1691,25 @@ async fn start_ffmpeg_proxy(url: String, deinterlace: bool) -> Result<u16, Strin
         .arg(&segment_pattern)
         .arg(&playlist_path);
 
-    let child = cmd
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(ffmpeg_log_stdio())
         .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg: {}. Is ffmpeg installed?", e))?;
+
+    // 确认 FFmpeg 真的产出了播放列表；失败则清理资源并把原因带回前端
+    if let Err(e) = wait_for_playlist(&playlist_path, &mut child).await {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+        let log_tail = read_ffmpeg_log_tail().await;
+        return Err(if log_tail.is_empty() {
+            e
+        } else {
+            format!("{}；FFmpeg 日志: {}", e, log_tail)
+        });
+    }
 
     let port = spawn_hls_files_server(hls_dir);
 

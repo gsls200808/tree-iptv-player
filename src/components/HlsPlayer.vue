@@ -13,6 +13,37 @@ import mpegts from 'mpegts.js';
 import * as dashjs from 'dashjs';
 import { getProxyUrl, startRtspProxy, stopRtspProxy, detectInterlaced, startFfmpegProxy, stopFfmpegProxy } from '../utils/tauriApi';
 
+// 隔行检测结果缓存（内存 + localStorage），换台或重启后无需重复探测
+const INTERLACE_CACHE_KEY = 'player.interlaceCache';
+const MAX_INTERLACE_CACHE = 300;
+
+const interlaceCache = new Map<string, boolean>(
+  (() => {
+    try {
+      const raw = localStorage.getItem(INTERLACE_CACHE_KEY);
+      if (!raw) return [];
+      const obj = JSON.parse(raw) as Record<string, boolean>;
+      return Object.entries(obj).filter(([, v]) => typeof v === 'boolean') as [string, boolean][];
+    } catch {
+      return [];
+    }
+  })()
+);
+
+function rememberInterlace(url: string, interlaced: boolean) {
+  interlaceCache.set(url, interlaced);
+  if (interlaceCache.size > MAX_INTERLACE_CACHE) {
+    const oldest = interlaceCache.keys().next().value;
+    if (oldest !== undefined) interlaceCache.delete(oldest);
+  }
+  try {
+    localStorage.setItem(INTERLACE_CACHE_KEY, JSON.stringify(Object.fromEntries(interlaceCache)));
+  } catch {
+    // localStorage 不可用时仅保留内存缓存
+  }
+}
+
+
 const props = withDefaults(
   defineProps<{
     src: string;
@@ -32,9 +63,8 @@ let dashPlayer: dashjs.MediaPlayerClass | null = null;
 let currentRtspUrl: string | null = null;
 let currentFfmpegUrl: string | null = null;
 let mseFallbackStarted = false;
-
-// 同一地址的隔行检测结果做缓存，避免重复探测
-const interlaceCache = new Map<string, boolean>();
+// 播放代次：用于丢弃换台后才返回的探测结果
+let playGeneration = 0;
 
 // 裸 MPEG-TS 直播流（rtp2httpd、udpxy 等组播转 HTTP 的地址）
 function isRawMpegtsUrl(lower: string): boolean {
@@ -365,11 +395,15 @@ const initHlsPlayer = async (streamUrl: string) => {
       backBufferLength: 90,
     });
 
+    // 网络错误有限重试：次数用完就报真实错误，避免无限转圈
+    let networkRetries = 0;
+
     hls.loadSource(streamUrl);
     hls.attachMedia(video);
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       console.log('HLS manifest loaded');
+      networkRetries = 0;
       loading.value = false;
       video.play().catch((e) => {
         console.log('Auto-play prevented:', e);
@@ -382,6 +416,13 @@ const initHlsPlayer = async (streamUrl: string) => {
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
             loading.value = false;
+            networkRetries += 1;
+            if (networkRetries > 5) {
+              error.value = '播放列表加载失败，请确认 FFmpeg 已正常启动';
+              hls?.destroy();
+              hls = null;
+              break;
+            }
             setTimeout(() => {
               if (hls) hls.startLoad();
             }, 3000);
@@ -416,22 +457,31 @@ const initHlsPlayer = async (streamUrl: string) => {
   }
 };
 
-// 判断是否需要反交错：仅隔行扫描流返回 true（结果按地址缓存）
-const shouldDeinterlace = async (originalUrl: string): Promise<boolean> => {
-  if (!props.autoDeinterlace) return false;
-
-  const cached = interlaceCache.get(originalUrl);
-  if (cached !== undefined) return cached;
-
+// 探测隔行扫描：仅在后台执行，不阻塞起播
+const probeInterlace = async (originalUrl: string): Promise<boolean> => {
   try {
     const interlaced = await detectInterlaced(originalUrl);
     console.log('Interlaced detection:', originalUrl, interlaced);
-    interlaceCache.set(originalUrl, interlaced);
+    rememberInterlace(originalUrl, interlaced);
     return interlaced;
   } catch (e) {
     console.warn('Interlaced detection failed:', e);
     return false;
   }
+};
+
+// 后台探测到隔行后，再把当前频道切到反交错转码
+const upgradeToDeinterlace = async (originalUrl: string, generation: number) => {
+  const interlaced = await probeInterlace(originalUrl);
+  if (!interlaced) return;
+  // 换台/重播后已过期的探测结果直接丢弃
+  if (generation !== playGeneration || props.src !== originalUrl) return;
+  // 已经在走 FFmpeg 代理（反交错或音轨转码）时不再重复切换
+  if (mseFallbackStarted || currentFfmpegUrl) return;
+
+  console.log('检测到隔行扫描，切换到反交错转码');
+  destroyPlayers();
+  await playWithFfmpegProxy(originalUrl, true);
 };
 
 // 用 FFmpeg 转码为本地 HLS 后播放：反交错，或修复 MSE 不支持的音轨
@@ -445,9 +495,12 @@ const playWithFfmpegProxy = async (originalUrl: string, deinterlace: boolean) =>
     await initHlsPlayer(hlsUrl);
   } catch (e) {
     console.error('FFmpeg proxy failed:', e);
-    error.value = deinterlace
-      ? '反交错转码启动失败，请确认已安装 FFmpeg'
-      : '音轨编码不兼容，FFmpeg 转码失败，请确认已安装 FFmpeg';
+    // 后端会把 FFmpeg 的真实失败原因（含日志末尾）带回，直接展示便于定位
+    const reason = e instanceof Error ? e.message : String(e);
+    const hint = deinterlace ? '反交错转码启动失败' : '音轨编码不兼容，转码失败';
+    error.value = reason
+      ? `${hint}：${reason}`
+      : `${hint}，请确认已安装 FFmpeg`;
     loading.value = false;
   }
 };
@@ -455,6 +508,7 @@ const playWithFfmpegProxy = async (originalUrl: string, deinterlace: boolean) =>
 const initPlayer = async () => {
   if (!videoElement.value) return;
 
+  const generation = ++playGeneration;
   destroyPlayers();
   await releaseFfmpegProxy();
   mseFallbackStarted = false;
@@ -494,18 +548,23 @@ const initPlayer = async () => {
     if (streamType === 'flv') {
       await initFlvPlayer(playUrl);
     } else if (streamType === 'mpegts') {
-      // 隔行扫描流自动反交错；逐行流保持原始播放，避免无谓的重编码
-      if (await shouldDeinterlace(originalUrl)) {
-        console.log('检测到隔行扫描，启用反交错');
+      // 已确认隔行的频道直接走反交错，省去一次无谓的直连起播
+      if (props.autoDeinterlace && interlaceCache.get(originalUrl) === true) {
+        console.log('已知隔行扫描，直接启用反交错');
         await playWithFfmpegProxy(originalUrl, true);
       } else {
+        // 先直连起播，保证换台速度；隔行探测放到后台
         await initMpegtsPlayer(playUrl, () => {
           // MSE 不支持该音轨（E-AC3、单声道等），用 FFmpeg 转 AAC 后播放
-          if (mseFallbackStarted) return;
+          if (mseFallbackStarted || generation !== playGeneration) return;
           mseFallbackStarted = true;
           destroyPlayers();
           void playWithFfmpegProxy(originalUrl, false);
         });
+
+        if (props.autoDeinterlace && interlaceCache.get(originalUrl) === undefined) {
+          void upgradeToDeinterlace(originalUrl, generation);
+        }
       }
     } else if (streamType === 'mpd') {
       await initDashPlayer(playUrl);
