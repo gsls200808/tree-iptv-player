@@ -8,20 +8,39 @@
 
 ## 功能
 
-- 播放m3u播放列表
-- 播放m3u8单个链接
-- EPG显示 支持xmltv diyp 格式 
-- PLTV格式回放
+### 播放
+
+- 播放 m3u 播放列表
+- 播放 m3u8 单个链接
 - HTTP-FLV 支持
-- RTSP 支持
-- m3u播放列表 kodi回看格式 tivimate回看格式兼容 待排期
-- MCE遥控器控制兼容 待排期
-- xbox手柄控制兼容 待排期
-- rtp支持 待排期
-- mpd格式支持 待排期
-- 播放列表diyp txt  普通txt 等格式兼容 待排期
-- m3u DRM 支持 待排期
-- mpd DRM 支持 待排期
+- RTSP 支持（依赖 ffmpeg）
+- MPEG-TS 直播流支持：rtp2httpd、udpxy 等组播转 HTTP 的地址（`/rtp/`、`/udp/`、`/udpxy/`、`.ts`）
+- MPEG-DASH（`.mpd`）支持
+- 隔行扫描自动反交错：全局开关，默认开启，仅对检测为隔行扫描的流生效，逐行流不受影响
+- 特殊音轨兼容：E-AC3、AC-3、多声道等浏览器不支持的音轨，自动转码为 AAC 后播放
+
+### 播放列表
+
+- m3u / m3u8 播放列表
+- DIYP TXT（含 `,#genre#` 分组标记）
+- 标准 TXT（`频道名,地址` 逐行格式）
+- 频道分组显示
+
+### EPG
+
+- XMLTV 格式
+- DIYP 格式（JSON）
+- 节目表显示、当前节目高亮
+- PLTV 回放：对 URL 含 `PLTV` / `TVOD` 的频道，可通过 `?playseek=` 回看已结束的节目
+
+### 待排期
+
+- m3u播放列表 kodi回看格式 tivimate回看格式兼容
+- MCE遥控器控制兼容
+- xbox手柄控制兼容
+- 原生 rtp:// 组播地址（浏览器无法直连组播，需经由 rtp2httpd / udpxy 转 HTTP）
+- m3u DRM 支持
+- mpd DRM 支持
 
 
 
@@ -49,7 +68,12 @@ npm run tauri build
 
 ## 运行依赖
 
-RTSP播放依赖ffmpeg，可以安装下面的方式安装
+以下功能依赖 ffmpeg（含 ffprobe）：
+- RTSP 播放
+- 隔行扫描检测与反交错转码
+- 特殊音轨（E-AC3 / AC-3 / 多声道）转 AAC
+
+未安装时上述功能不可用，其他格式不受影响。安装方式：
 
 ### Windows下载安装ffmpeg
 
